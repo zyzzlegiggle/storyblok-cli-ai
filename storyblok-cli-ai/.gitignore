@@ -32,3 +32,5 @@ dist/
 # Operating System files
 .DS_Store # macOS
 Thumbs.db # Windows
+
+apptest

@@ -37,7 +37,7 @@ type GenerateResponse struct {
 // backendURL must be the full endpoint, e.g., http://127.0.0.1:8000/generate/
 func GenerateAndWriteProject(backendURL string, payload GenerateRequest, projectDir string) error {
 	// 1) POST the request
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
 
 	reqBody, err := json.Marshal(payload)

@@ -150,6 +150,12 @@ func runCreateWizard(cmd *cobra.Command) error {
 	if err := scaffold.GenerateAndWriteProject(backendURL, payload, absTarget); err != nil {
 		return err
 	}
+    // After GenerateAndWriteProject succeeds
+    fmt.Println("\n⚠️  Security note:")
+    fmt.Println("  - A .env file containing your Storyblok token was written to the project root.")
+    fmt.Println("  - Do NOT commit .env to source control. Add it to .gitignore (already included).")
+    fmt.Println("  - If you prefer not to store the token, remove .env and set VITE_STORYBLOK_TOKEN in your environment.")
+
 
 	fmt.Println("Done. Next steps:")
 	fmt.Printf("  cd %s\n", absTarget)
