@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/AlecAivazis/survey/v2"
+	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/cobra"
 
 	"storyblok-cli-ai/internal/scaffold"
@@ -89,6 +91,31 @@ func callBackend(backendURL string, payload map[string]interface{}) (map[string]
 	return parsed, nil
 }
 
+// ---------------- Streaming helper ----------------
+
+// callBackendStream posts the payload to the /generate/stream endpoint and returns the http.Response (caller must close body)
+func callBackendStream(backendURL string, payload map[string]interface{}) (*http.Response, error) {
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequest("POST", backendURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// no timeout to allow long streams; use a client with a long timeout
+	client := &http.Client{Timeout: 0}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// read body for error message
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("backend returned status %d: %s", resp.StatusCode, string(b))
+	}
+	return resp, nil
+}
+
 // ---------------- Utilities ----------------
 
 func slugify(s string) string {
@@ -162,6 +189,22 @@ func parseFilesFromResponse(resp map[string]interface{}) []scaffold.FileOut {
 	return out
 }
 
+// ---------------- Helper: read stream events ----------------
+
+type streamEvent struct {
+	Event   string      `json:"event"`
+	Payload interface{} `json:"payload"`
+}
+
+// read one JSON line (ndjson) from reader
+func readJSONLine(r *bufio.Reader) ([]byte, error) {
+	line, err := r.ReadBytes('\n')
+	if err != nil {
+		return nil, err
+	}
+	return bytes.TrimSpace(line), nil
+}
+
 // ---------------- Main wizard ----------------
 
 func runCreateWizard(cmd *cobra.Command) error {
@@ -226,6 +269,7 @@ func runCreateWizard(cmd *cobra.Command) error {
 		},
 	}
 
+	backendStreamURL := "http://127.0.0.1:8000/generate/stream"
 	backendURL := "http://127.0.0.1:8000/generate/"
 
 	// --- New: ask backend to generate structured requirements questions (guarantee at least one) ---
@@ -290,78 +334,264 @@ func runCreateWizard(cmd *cobra.Command) error {
 	// 5) followup loop
 	maxRounds := 20
 	for round := 0; round < maxRounds; round++ {
-		respMap, err := callBackend(backendURL, payload)
+		// call streaming endpoint to get progress + files
+		resp, err := callBackendStream(backendStreamURL, payload)
 		if err != nil {
-			return fmt.Errorf("call backend: %w", err)
-		}
-
-		// Check for top-level followups
-		var followups []map[string]interface{}
-		if fRaw, ok := respMap["followups"]; ok {
-			if arr, ok := fRaw.([]interface{}); ok {
-				for _, it := range arr {
-					if m, ok := it.(map[string]interface{}); ok {
-						followups = append(followups, m)
-					} else if s, ok := it.(string); ok {
-						followups = append(followups, map[string]interface{}{"id": "", "question": s, "type": "text", "default": ""})
+			// fallback to non-streaming behavior (older backend)
+			respMap, err2 := callBackend(backendURL, payload)
+			if err2 != nil {
+				return fmt.Errorf("call backend (stream failed, fallback failed): %v / %v", err, err2)
+			}
+			// same behavior as before
+			var followups []map[string]interface{}
+			if fRaw, ok := respMap["followups"]; ok {
+				if arr, ok := fRaw.([]interface{}); ok {
+					for _, it := range arr {
+						if m, ok := it.(map[string]interface{}); ok {
+							followups = append(followups, m)
+						} else if s, ok := it.(string); ok {
+							followups = append(followups, map[string]interface{}{"id": "", "question": s, "type": "text", "default": ""})
+						}
 					}
 				}
 			}
-		}
 
-		if len(followups) == 0 {
-			// final response: expect files
-			files := parseFilesFromResponse(respMap)
-			if len(files) == 0 {
-				return fmt.Errorf("backend returned no files and no followups")
+			if len(followups) == 0 {
+				files := parseFilesFromResponse(respMap)
+				if len(files) == 0 {
+					return fmt.Errorf("backend returned no files and no followups")
+				}
+				if err := scaffold.WriteFilesAtomically(files, absTarget); err != nil {
+					return fmt.Errorf("writing project files: %w", err)
+				}
+				fmt.Println("Project created successfully at:", absTarget)
+				fmt.Println("\n⚠️  Security note:")
+				fmt.Println("  - A .env file containing your Storyblok token may have been written to the project root.")
+				fmt.Println("  - Do NOT commit .env to source control. .gitignore includes .env by default.")
+				fmt.Println("  - If you prefer not to store the token, remove .env and set VITE_STORYBLOK_TOKEN in your environment.")
+				return nil
 			}
-			// Write files atomically
-			if err := scaffold.WriteFilesAtomically(files, absTarget); err != nil {
-				return fmt.Errorf("writing project files: %w", err)
+
+			// ask followups and continue
+			answersMap, err := promptFollowupsAndCollect(followups)
+			if err != nil {
+				return fmt.Errorf("aborted while answering followups: %w", err)
 			}
-
-			fmt.Println("Project created successfully at:", absTarget)
-			// security note
-			fmt.Println("\n⚠️  Security note:")
-			fmt.Println("  - A .env file containing your Storyblok token may have been written to the project root.")
-			fmt.Println("  - Do NOT commit .env to source control. .gitignore includes .env by default.")
-			fmt.Println("  - If you prefer not to store the token, remove .env and set VITE_STORYBLOK_TOKEN in your environment.")
-			return nil
-		}
-
-		// We have followup questions to ask
-		answersMap, err := promptFollowupsAndCollect(followups)
-		if err != nil {
-			return fmt.Errorf("aborted while answering followups: %w", err)
-		}
-
-		// attach followup answers into payload.user_answers.followup_answers
-		userAns, _ := payload["user_answers"].(map[string]interface{})
-		if userAns == nil {
-			userAns = map[string]interface{}{}
-		}
-		existing := map[string]string{}
-		if fa, ok := userAns["followup_answers"].(map[string]string); ok {
-			existing = fa
-		} else if fa2, ok := userAns["followup_answers"].(map[string]interface{}); ok {
-			for k, v := range fa2 {
-				if s, ok := v.(string); ok {
-					existing[k] = s
+			userAns, _ := payload["user_answers"].(map[string]interface{})
+			if userAns == nil {
+				userAns = map[string]interface{}{}
+			}
+			existing := map[string]string{}
+			if fa, ok := userAns["followup_answers"].(map[string]string); ok {
+				existing = fa
+			} else if fa2, ok := userAns["followup_answers"].(map[string]interface{}); ok {
+				for k, v := range fa2 {
+					if s, ok := v.(string); ok {
+						existing[k] = s
+					}
 				}
 			}
+			for k, v := range answersMap {
+				existing[k] = v
+			}
+			faInterface := map[string]interface{}{}
+			for k, v := range existing {
+				faInterface[k] = v
+			}
+			userAns["followup_answers"] = faInterface
+			payload["user_answers"] = userAns
+			continue
 		}
-		for k, v := range answersMap {
-			existing[k] = v
-		}
-		// convert back to map[string]interface{} for JSON marshaling
-		faInterface := map[string]interface{}{}
-		for k, v := range existing {
-			faInterface[k] = v
-		}
-		userAns["followup_answers"] = faInterface
-		payload["user_answers"] = userAns
 
-		// loop again
+		// Stream reader
+		reader := bufio.NewReader(resp.Body)
+
+		// temp dir to store files as they stream
+		tmpDir, _ := os.MkdirTemp("", "ai_stream_*")
+		defer os.RemoveAll(tmpDir)
+		// map path -> temp file path
+		tempFiles := map[string]string{}
+		// set to collect completed files for final atomic write
+		completedFiles := []scaffold.FileOut{}
+
+		// progress bar (indeterminate until finished)
+		var pb *progressbar.ProgressBar
+		generatedCount := 0
+
+		handleFollowups := func(followupsIface interface{}) (bool, error) {
+			// convert to []map[string]interface{}
+			out := []map[string]interface{}{}
+			if arr, ok := followupsIface.([]interface{}); ok {
+				for _, it := range arr {
+					if m, ok := it.(map[string]interface{}); ok {
+						out = append(out, m)
+					} else if s, ok := it.(string); ok {
+						out = append(out, map[string]interface{}{"id": "", "question": s, "type": "text", "default": ""})
+					}
+				}
+			}
+			if len(out) == 0 {
+				return false, nil
+			}
+			// close stream body and prompt user
+			_ = resp.Body.Close()
+			ansMap, err := promptFollowupsAndCollect(out)
+			if err != nil {
+				return false, err
+			}
+			// attach answers and break to outer loop
+			userAns, _ := payload["user_answers"].(map[string]interface{})
+			if userAns == nil {
+				userAns = map[string]interface{}{}
+			}
+			existing := map[string]string{}
+			if fa, ok := userAns["followup_answers"].(map[string]string); ok {
+				existing = fa
+			} else if fa2, ok := userAns["followup_answers"].(map[string]interface{}); ok {
+				for k, v := range fa2 {
+					if s, ok := v.(string); ok {
+						existing[k] = s
+					}
+				}
+			}
+			for k, v := range ansMap {
+				existing[k] = v
+			}
+			faInterface := map[string]interface{}{}
+			for k, v := range existing {
+				faInterface[k] = v
+			}
+			userAns["followup_answers"] = faInterface
+			payload["user_answers"] = userAns
+			return true, nil
+		}
+
+		// read loop
+		for {
+			lineBytes, err := readJSONLine(reader)
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				// close and return on other errors
+				_ = resp.Body.Close()
+				return fmt.Errorf("error reading stream: %w", err)
+			}
+			var ev map[string]interface{}
+			if err := json.Unmarshal(lineBytes, &ev); err != nil {
+				// ignore malformed line
+				continue
+			}
+			etype, _ := ev["event"].(string)
+			payloadEv := ev["payload"]
+
+			switch etype {
+			case "followups":
+				// backend requests clarifying questions: prompt user then continue outer loop
+				shouldContinue, err := handleFollowups(payloadEv)
+				if err != nil {
+					return fmt.Errorf("error while handling followups: %w", err)
+				}
+				if shouldContinue {
+					// break reading and restart outer followup loop
+					break
+				}
+			case "file_start":
+				m, _ := payloadEv.(map[string]interface{})
+				path, _ := m["path"].(string)
+				// create temp file to append chunks
+				tf := filepath.Join(tmpDir, strings.ReplaceAll(path, "/", "__"))
+				_ = os.MkdirAll(filepath.Dir(tf), 0o755)
+				// ensure file exists (trunc)
+				_ = os.WriteFile(tf, []byte(""), 0o644)
+				tempFiles[path] = tf
+			case "file_chunk":
+				m, _ := payloadEv.(map[string]interface{})
+				path, _ := m["path"].(string)
+				chunk, _ := m["chunk"].(string)
+				final, _ := m["final"].(bool)
+				tf, ok := tempFiles[path]
+				if !ok {
+					// create if not present
+					tf = filepath.Join(tmpDir, strings.ReplaceAll(path, "/", "__"))
+					_ = os.WriteFile(tf, []byte(""), 0o644)
+					tempFiles[path] = tf
+				}
+				// append chunk
+				f, ferr := os.OpenFile(tf, os.O_APPEND|os.O_WRONLY, 0o644)
+				if ferr == nil {
+					_, _ = f.WriteString(chunk)
+					f.Close()
+				}
+				_ = final // nothing now
+			case "file_complete":
+				m, _ := payloadEv.(map[string]interface{})
+				path, _ := m["path"].(string)
+				tf := tempFiles[path]
+				// read temp file into memory
+				contentBytes, _ := os.ReadFile(tf)
+				content := string(contentBytes)
+				completedFiles = append(completedFiles, scaffold.FileOut{Path: path, Content: content})
+				generatedCount += 1
+				// initialize progress bar if needed
+				if pb == nil {
+					pb = progressbar.NewOptions(-1,
+						progressbar.OptionSetDescription("Generating files"),
+						progressbar.OptionShowCount(),
+						progressbar.OptionSpinnerType(14),
+					)
+				}
+				_ = pb.Add(1)
+			case "warning":
+				// print warnings
+				if s, ok := payloadEv.(string); ok {
+					fmt.Printf("\nWARNING: %s\n", s)
+				} else {
+					bs, _ := json.Marshal(payloadEv)
+					fmt.Printf("\nWARNING: %s\n", string(bs))
+				}
+			case "done":
+				// final event; break reading
+				// finish progress bar if exists
+				if pb != nil {
+					_ = pb.Finish()
+				}
+				break
+			default:
+				// ignore other events (dependency/validation intentionally ignored)
+			}
+
+			// continue reading until done or followups
+		}
+
+		// ensure final newline for progress if progress bar not used
+		if pb == nil {
+			fmt.Printf("\n")
+		}
+
+		// close response body now
+		_ = resp.Body.Close()
+
+		// If followups were delivered and we handled them, continue outer loop
+		// (we detect this because payload["user_answers"] will have updated followup_answers)
+		// Check if there are followup answers present and no completedFiles - then skip finalize
+		if len(completedFiles) == 0 {
+			// continue to next round (likely after prompting followups)
+			// loop will restart and call backend again with updated payload
+			continue
+		}
+
+		// final: write files atomically from completedFiles
+		if err := scaffold.WriteFilesAtomically(completedFiles, absTarget); err != nil {
+			return fmt.Errorf("writing project files: %w", err)
+		}
+
+		fmt.Println("Project created successfully at:", absTarget)
+		fmt.Println("\n⚠️  Security note:")
+		fmt.Println("  - A .env file containing your Storyblok token may have been written to the project root.")
+		fmt.Println("  - Do NOT commit .env to source control. .gitignore includes .env by default.")
+		fmt.Println("  - If you prefer not to store the token, remove .env and set VITE_STORYBLOK_TOKEN in your environment.")
+		return nil
 	}
 
 	return fmt.Errorf("maximum followup rounds reached (%d). Aborting", maxRounds)

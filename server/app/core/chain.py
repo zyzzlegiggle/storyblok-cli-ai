@@ -247,6 +247,237 @@ def _normalize_followup_item(raw) -> Optional[Dict[str, Any]]:
         return {"id": str(qid), "question": str(question), "type": str(ftype), "default": default}
     return None
 
+STREAM_CHUNK_SZ = int(os.environ.get("AI_STREAM_CHUNK_SZ", 1024))
+
+async def _yield_event(event_type: str, payload: Any):
+    """
+    Small helper to produce newline-delimited JSON events (string).
+    Caller can 'yield' these strings from the async generator.
+    """
+    try:
+        out = {"event": event_type, "payload": payload}
+        return json.dumps(out, ensure_ascii=False) + "\n"
+    except Exception:
+        # best-effort fallback
+        return json.dumps({"event": "error", "payload": f"failed to serialize {event_type}"}) + "\n"
+
+
+async def stream_generate_project(payload: Dict[str, Any]):
+    """
+    Async generator that yields newline-delimited JSON events (as strings).
+    This function mirrors generate_project_files but streams progress as events.
+    """
+    user_answers = payload.get("user_answers", {}) or {}
+    schema = payload.get("storyblok_schema", {}) or {}
+    options = payload.get("options", {}) or {}
+    debug = bool(options.get("debug", False))
+    followup_answers = user_answers.get("followup_answers", {}) or {}
+
+    app_name = user_answers.get("app_name", user_answers.get("project_name", "storyblok-app"))
+
+    system_prompt = build_system_prompt()
+    user_for_prompt = dict(user_answers)
+    user_for_prompt.update({"followup_answers": followup_answers})
+    user_prompt = build_user_prompt(user_for_prompt, schema, options)
+
+    # Diagnostic / question generation (same logic as generate_project_files)
+    diag_parsed = None
+    try:
+        max_questions = int(options.get("max_questions", 3))
+        request_questions = bool(options.get("request_questions", False))
+
+        if request_questions:
+            q_instruction = (
+                system_prompt
+                + "\n\n"
+                + user_prompt
+                + f"\n\nYou are asked to produce up to {max_questions} structured clarifying questions to gather requirements from the user. "
+                  'Return JSON exactly like: {"followups":[{"id":"q1","question":"...","type":"text","default":"..."}, ...]} '
+                  "If you think no clarifying questions are needed, return {\"followups\":[]}."
+                  "Respond only with valid JSON of that shape."
+            )
+            diag_parsed = await call_structured_generation(q_instruction, GenerateResponseModel, max_retries=1, timeout=30, debug=debug)
+        else:
+            diag_instruction = (
+                system_prompt
+                + "\n\n"
+                + user_prompt
+                + "\n\nIf you require clarifying questions, respond with JSON exactly like: {\"followups\": [\"question1\", ...]} otherwise {\"followups\": []}. "
+                "Respond only with valid JSON with that shape."
+            )
+            diag_parsed = await call_structured_generation(diag_instruction, GenerateResponseModel, max_retries=1, timeout=30, debug=debug)
+    except Exception:
+        diag_parsed = None
+
+    diag_parsed = _ensure_parsed_dict("diag_parsed", diag_parsed)
+
+    raw_followups = None
+    if isinstance(diag_parsed, dict):
+        if diag_parsed.get("followups"):
+            raw_followups = diag_parsed.get("followups")
+        elif diag_parsed.get("metadata") and isinstance(diag_parsed.get("metadata"), dict):
+            raw_followups = diag_parsed.get("metadata", {}).get("followups")
+        else:
+            raw_followups = None
+
+    normalized = []
+    if isinstance(raw_followups, list) and len(raw_followups) > 0:
+        for item in raw_followups:
+            nf = _normalize_followup_item(item)
+            if nf and nf.get("question"):
+                normalized.append(nf)
+
+    request_questions = bool(options.get("request_questions", False))
+    if request_questions and not normalized:
+        normalized = [{
+            "id": f"q_{int(time.time()*1000)}",
+            "question": "Please list the key requirements for the app (pages, main features, and visual style).",
+            "type": "text",
+            "default": ""
+        }]
+
+    # If followups are required, stream them and finish
+    if normalized and (not followup_answers or len(followup_answers.keys()) == 0):
+        yield await _yield_event("followups", normalized)
+        return
+
+    # Generation (streamed)
+    components = schema.get("components", []) or []
+    generated_files: List[Dict[str, str]] = []
+    merged_warnings: List[str] = []
+    llm_debug_all = []
+
+    # helper to stream a list of files (will chunk file content into chunks)
+    async def _stream_files_list(files_list: List[Dict[str, str]]):
+        for f in files_list:
+            path = os.path.normpath(f.get("path", "") or "")
+            content = f.get("content", "") or ""
+            # file_start
+            await_event = await _yield_event("file_start", {"path": path})
+            yield await_event
+            # accumulate the file for later dependency pinning / validation
+            try:
+                accumulated_files.append({"path": path, "content": content})
+            except Exception:
+                pass
+            # stream chunks
+            if not isinstance(content, str):
+                content = str(content)
+            idx = 0
+            for i in range(0, len(content), STREAM_CHUNK_SZ):
+                chunk = content[i:i+STREAM_CHUNK_SZ]
+                final = (i + STREAM_CHUNK_SZ) >= len(content)
+                yield await _yield_event("file_chunk", {"path": path, "chunk": chunk, "index": idx, "final": final})
+                idx += 1
+            # file_complete
+            yield await _yield_event("file_complete", {"path": path, "size": len(content)})
+
+    # If there are no components, single-shot generation
+    if not components:
+        full_prompt = system_prompt + "\n" + user_prompt + "\n\nReturn JSON with project_name, files[], metadata."
+        parsed = await call_structured_generation(full_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
+        parsed = _ensure_parsed_dict("full_gen", parsed)
+        files = parsed.get("files", []) or []
+        # stream each file
+        async for ev in _stream_files_list(files):
+            yield ev
+        if parsed.get("metadata", {}).get("warnings"):
+            for w in parsed.get("metadata", {}).get("warnings"):
+                yield await _yield_event("warning", w)
+        if debug:
+            llm_debug_all.append(parsed)
+    else:
+        # chunked component generation
+        total_files_so_far = 0
+        for idx, chunk in enumerate(chunk_components(components, CHUNK_SIZE)):
+            chunk_schema = {"components": chunk}
+            chunk_user_prompt = build_user_prompt(user_for_prompt, chunk_schema, options)
+            chunk_prompt = system_prompt + "\n" + chunk_user_prompt + "\n\nReturn JSON with files[] (only files for these components)."
+            parsed = await call_structured_generation(chunk_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
+            parsed = _ensure_parsed_dict(f"chunk_{idx}_gen", parsed)
+            files = parsed.get("files", []) or []
+            # stream files for this chunk
+            async for ev in _stream_files_list(files):
+                yield ev
+            if parsed.get("metadata", {}).get("warnings"):
+                for w in parsed.get("metadata", {}).get("warnings"):
+                    yield await _yield_event("warning", w)
+            if debug:
+                llm_debug_all.append(parsed)
+
+        # scaffold
+        scaffold_prompt = system_prompt + "\n" + user_prompt + "\n\nNow produce project-level scaffolding files (package.json, tsconfig, pages, services, env files). Return JSON with files[]."
+        parsed_scaffold = await call_structured_generation(scaffold_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
+        parsed_scaffold = _ensure_parsed_dict("scaffold_gen", parsed_scaffold)
+        scaffold_files = parsed_scaffold.get("files", []) or []
+        async for ev in _stream_files_list(scaffold_files):
+            yield ev
+        if parsed_scaffold.get("metadata", {}).get("warnings"):
+            for w in parsed_scaffold.get("metadata", {}).get("warnings"):
+                yield await _yield_event("warning", w)
+        if debug:
+            llm_debug_all.append(parsed_scaffold)
+
+    # Dependency pinning + validation: run once against accumulated_files (no extra LLM calls)
+    try:
+        if accumulated_files:
+            try:
+                # resolve and pin dependency versions in package.json if present
+                pinned_files, dep_meta = resolve_and_pin_dependencies(list(accumulated_files), options)
+            except Exception as e:
+                dep_meta = {"warnings": [f"dependency resolution failed: {e}"]}
+
+            # emit any resolved dependency info if available
+            try:
+                resolved = dep_meta.get("resolved") if isinstance(dep_meta, dict) else None
+                if isinstance(resolved, list):
+                    for d in resolved:
+                        # emit dependency event so CLI (if desired) can pick it up; else ignored by CLI per your request
+                        yield await _yield_event("dependency", d)
+            except Exception:
+                pass
+
+            # emit any warnings from dependency step
+            try:
+                if isinstance(dep_meta, dict) and dep_meta.get("warnings"):
+                    for w in dep_meta.get("warnings", []):
+                        yield await _yield_event("warning", w)
+            except Exception:
+                pass
+
+            # optional TypeScript validation step (if requested)
+            try:
+                validate = bool(options.get("validate", False))
+                if validate:
+                    tmpdir = tempfile.mkdtemp(prefix="ai_gen_")
+                    try:
+                        for f in pinned_files:
+                            target = Path(tmpdir) / f["path"]
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_text(f.get("content", ""), encoding="utf-8")
+                        res = run_tsc_check(tmpdir)
+                        # emit validation output as a warning (CLI currently ignores validation events)
+                        yield await _yield_event("validation", res)
+                    finally:
+                        shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+        else:
+            # no files were streamed; nothing to validate/pin
+            pass
+    except Exception: 
+        pass
+
+    # done - report files_count if available
+    try:
+        final_resp = await generate_project_files(payload)
+        files_count = len(final_resp.get("files", []) or [])
+    except Exception:
+        files_count = 0
+    yield await _yield_event("done", {"files_count": files_count})
+    return
+
+
 # ----------------------------
 # Main orchestration
 # ----------------------------
@@ -345,6 +576,7 @@ async def generate_project_files(payload: Dict[str, Any]) -> Dict[str, Any]:
     generated_files: List[Dict[str, str]] = []
     merged_warnings: List[str] = []
     llm_debug_all = []
+    accumulated_files: List[Dict[str, str]] = []
 
     if not components:
         full_prompt = system_prompt + "\n" + user_prompt + "\n\nReturn JSON with project_name, files[], metadata."
