@@ -5,31 +5,172 @@ import time
 import shutil
 import subprocess
 import tempfile
+import traceback
+import pickle
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 from core.llm_client import call_structured_generation, GenerateResponseModel
 from core.prompts import build_system_prompt, build_user_prompt
 
-# Config (env override)
+# ----------------------------
+# Configuration / env overrides
+# ----------------------------
 CHUNK_SIZE = int(os.environ.get("AI_CHUNK_SIZE", 10))
-LLM_RETRIES = int(os.environ.get("AI_RETRY_COUNT", 2))  # number of retries (per user: 2)
+LLM_RETRIES = int(os.environ.get("AI_RETRY_COUNT", 2))
 TIMEOUT = int(os.environ.get("AI_TIMEOUT", 180))
 LOG_DIR = os.environ.get("AI_BACKEND_LOG_DIR", "./ai_backend_logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
+# ----------------------------
+# NPM registry helpers & curated map
+# ----------------------------
+import requests
 
+NPM_REGISTRY = "https://registry.npmjs.org"
+NPM_CACHE_FILE = os.path.join(LOG_DIR, "npm_cache.pkl")
+NPM_CACHE_TTL = 24 * 3600  # seconds
+
+# curated dependency map file path (one level up from this file: ai_backend_demo/dependency_map.json)
+DEP_MAP_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dependency_map.json")
+try:
+    with open(DEP_MAP_PATH, "r", encoding="utf-8") as fh:
+        CURATED_DEP_MAP = json.load(fh)
+except Exception:
+    CURATED_DEP_MAP = {}
+
+def _load_npm_cache():
+    try:
+        if os.path.exists(NPM_CACHE_FILE):
+            mtime = os.path.getmtime(NPM_CACHE_FILE)
+            if time.time() - mtime < NPM_CACHE_TTL:
+                with open(NPM_CACHE_FILE, "rb") as fh:
+                    return pickle.load(fh)
+    except Exception:
+        pass
+    return {}
+
+def _save_npm_cache(cache):
+    try:
+        with open(NPM_CACHE_FILE, "wb") as fh:
+            pickle.dump(cache, fh)
+    except Exception:
+        pass
+
+def get_latest_npm_version(pkg_name: str) -> Optional[str]:
+    """
+    Query npm registry for dist-tags.latest. Returns version string or None.
+    Caches results for NPM_CACHE_TTL.
+    """
+    try:
+        cache = _load_npm_cache()
+        key = pkg_name
+        if key in cache:
+            entry = cache[key]
+            if time.time() - entry.get("ts", 0) < NPM_CACHE_TTL:
+                return entry.get("ver")
+        url = f"{NPM_REGISTRY}/{pkg_name}"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        dist_tags = data.get("dist-tags", {})
+        latest = dist_tags.get("latest")
+        if latest:
+            cache[key] = {"ver": latest, "ts": time.time()}
+            _save_npm_cache(cache)
+            return latest
+        if "version" in data:
+            v = data.get("version")
+            cache[key] = {"ver": v, "ts": time.time()}
+            _save_npm_cache(cache)
+            return v
+        return None
+    except Exception:
+        return None
+
+def _pin_dep_version(name: str, requested: Any) -> (str, str):
+    """
+    Return (name, pinned_version). Prefer curated map entries; otherwise query npm; otherwise fallback.
+    """
+    # prefer curated map (search across stacks)
+    try:
+        for stack, mapping in CURATED_DEP_MAP.items():
+            deps = mapping.get("dependencies", {})
+            devs = mapping.get("devDependencies", {})
+            if name in deps:
+                return name, deps[name]
+            if name in devs:
+                return name, devs[name]
+    except Exception:
+        pass
+
+    # query npm
+    latest = get_latest_npm_version(name)
+    if latest:
+        return name, latest
+
+    # fallback: strip ^/~ if requested is str
+    try:
+        if isinstance(requested, str):
+            stripped = requested.lstrip("^~")
+            if stripped:
+                return name, stripped
+    except Exception:
+        pass
+    return name, "1.0.0"
+
+def resolve_and_pin_dependencies(files: List[Dict[str, str]], options: Dict[str, Any]) -> (List[Dict[str, str]], Dict[str, Any]):
+    """
+    Find package.json in files, pin dependency versions using curated map + npm registry.
+    Returns updated files and a metadata dict about dependency resolution.
+    """
+    meta = {"resolved": [], "warnings": [], "lockfile": {"skipped": True, "reason": "npm not available on backend"}}
+    pkg_idx = None
+    pkg_obj = None
+    for i, f in enumerate(files):
+        path = os.path.normpath(f.get("path", ""))
+        if path == "package.json" or path.endswith("/package.json"):
+            try:
+                pkg_obj = json.loads(f.get("content", "") or "{}")
+                pkg_idx = i
+            except Exception as e:
+                meta["warnings"].append(f"failed to parse package.json: {e}")
+                pkg_obj = None
+            break
+
+    if pkg_obj is None:
+        return files, meta
+
+    for sec in ("dependencies", "devDependencies", "peerDependencies"):
+        sec_map = pkg_obj.get(sec, {}) or {}
+        pinned = {}
+        for name, requested in sec_map.items():
+            nm, pv = _pin_dep_version(name, requested)
+            pinned[nm] = pv
+            meta["resolved"].append({"name": nm, "version": pv, "origin": "curated_or_registry"})
+        if pinned:
+            pkg_obj[sec] = pinned
+
+    try:
+        files[pkg_idx]["content"] = json.dumps(pkg_obj, indent=2)
+    except Exception:
+        meta["warnings"].append("failed to re-serialize package.json after pinning")
+
+    meta["lockfile"] = {"skipped": True, "reason": "npm not available on backend (no lockfile generated)"}
+    return files, meta
+
+# ----------------------------
+# Utility & file helpers
+# ----------------------------
 def chunk_components(components: List[Dict[str, Any]], chunk_size: int = CHUNK_SIZE):
     for i in range(0, len(components), chunk_size):
         yield components[i:i + chunk_size]
 
-
 def run_tsc_check(project_dir: str) -> Dict[str, Any]:
     """
     Best-effort TypeScript check. Uses npx tsc --noEmit or tsc --noEmit if available.
-    Returns dict: {ok: bool, skipped: bool, output: str}
     """
-    # prefer npx if available
     cmd = None
     if shutil.which("npx"):
         cmd = ["npx", "tsc", "--noEmit"]
@@ -37,7 +178,6 @@ def run_tsc_check(project_dir: str) -> Dict[str, Any]:
         cmd = ["tsc", "--noEmit"]
     else:
         return {"ok": False, "skipped": True, "output": "tsc not found; skipping TypeScript validation"}
-
     try:
         proc = subprocess.run(cmd, cwd=project_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
         ok = proc.returncode == 0
@@ -45,9 +185,56 @@ def run_tsc_check(project_dir: str) -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "skipped": False, "output": f"tsc execution failed: {e}"}
 
+# ----------------------------
+# Robust parsing helpers for LLM outputs
+# ----------------------------
+def _ensure_parsed_dict(name: str, parsed) -> Dict[str, Any]:
+    """
+    Ensure parsed is a plain dict. If not, attempt conversions or write debug file and return {}.
+    """
+    try:
+        if parsed is None:
+            fname = f"{int(time.time())}_{name}_none.log"
+            with open(os.path.join(LOG_DIR, fname), "w", encoding="utf-8") as fh:
+                fh.write(f"{name} returned None\n")
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+        if hasattr(parsed, "dict"):
+            try:
+                return parsed.dict()
+            except Exception:
+                pass
+        if hasattr(parsed, "__dict__"):
+            try:
+                return dict(parsed.__dict__)
+            except Exception:
+                pass
+        s = str(parsed)
+        try:
+            return json.loads(s)
+        except Exception:
+            fname = f"{int(time.time())}_{name}_unparseable.json"
+            with open(os.path.join(LOG_DIR, fname), "w", encoding="utf-8") as fh:
+                fh.write("UNPARSEABLE DIAGNOSTIC RESULT\n\n")
+                fh.write("repr(parsed):\n")
+                fh.write(repr(parsed) + "\n\n")
+                fh.write("str(parsed):\n")
+                fh.write(s + "\n\n")
+                fh.write("traceback:\n")
+                fh.write(traceback.format_exc())
+            return {}
+    except Exception:
+        fname = f"{int(time.time())}_{name}_ensure_exception.log"
+        with open(os.path.join(LOG_DIR, fname), "w", encoding="utf-8") as fh:
+            fh.write("Exception in _ensure_parsed_dict:\n")
+            fh.write(traceback.format_exc())
+        return {}
 
+# ----------------------------
+# Followup normalization
+# ----------------------------
 def _normalize_followup_item(raw) -> Optional[Dict[str, Any]]:
-    """Coerce LLM-provided followup into expected shape {id, question, type, default}"""
     if raw is None:
         return None
     if isinstance(raw, str):
@@ -60,66 +247,15 @@ def _normalize_followup_item(raw) -> Optional[Dict[str, Any]]:
         return {"id": str(qid), "question": str(question), "type": str(ftype), "default": default}
     return None
 
-
-def _ensure_parsed_dict(name, parsed, log_dir=LOG_DIR):
-    """
-    Ensure parsed is a plain dict. If it's None or an unexpected object,
-    try to convert to dict, else write debug file and return {}.
-    """
-    try:
-        if parsed is None:
-            # nothing returned
-            fname = f"{int(time.time())}_diag_none.log"
-            with open(os.path.join(log_dir, fname), "w", encoding="utf-8") as fh:
-                fh.write(f"{name} returned None\n")
-            return {}
-        if isinstance(parsed, dict):
-            return parsed
-        # try pydantic/dot->dict
-        if hasattr(parsed, "dict"):
-            try:
-                return parsed.dict()
-            except Exception:
-                pass
-        if hasattr(parsed, "__dict__"):
-            try:
-                return dict(parsed.__dict__)
-            except Exception:
-                pass
-        # try parsing JSON-ish string
-        s = str(parsed)
-        try:
-            return json.loads(s)
-        except Exception:
-            # failed to parse
-            fname = f"{int(time.time())}_diag_unparseable.json"
-            with open(os.path.join(log_dir, fname), "w", encoding="utf-8") as fh:
-                fh.write("UNPARSEABLE DIAGNOSTIC RESULT\n\n")
-                fh.write("repr(parsed):\n")
-                fh.write(repr(parsed) + "\n\n")
-                fh.write("str(parsed):\n")
-                fh.write(s + "\n\n")
-                fh.write("exception traceback:\n")
-                fh.write(traceback.format_exc())
-            return {}
-    except Exception as e:
-        # In case of any unexpected error, log and return empty dict
-        fname = f"{int(time.time())}_diag_exception.log"
-        with open(os.path.join(log_dir, fname), "w", encoding="utf-8") as fh:
-            fh.write("Exception normalizing diag_parsed:\n")
-            fh.write(str(e) + "\n")
-            fh.write(traceback.format_exc())
-        return {}
-
-
+# ----------------------------
+# Main orchestration
+# ----------------------------
 async def generate_project_files(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Main entrypoint:
-      - payload: {user_answers: {...}, storyblok_schema: {...}, options: {...}}
-      - may return early with:
-          {"project_name": "...", "files": [], "followups": [...], "llm_debug": {...}}
-      - or return final:
-          {"project_name": "...", "files": [{"path","content"},...], "metadata": {...}, "llm_debug": {...}}
+    Entry point for /generate/:
+      - payload: { user_answers, storyblok_schema, options }
+      - returns either early with followups: top-level "followups" + files: []
+      - or full project: "files", "metadata", optional "llm_debug"
     """
     user_answers = payload.get("user_answers", {}) or {}
     schema = payload.get("storyblok_schema", {}) or {}
@@ -129,68 +265,46 @@ async def generate_project_files(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     app_name = user_answers.get("app_name", user_answers.get("project_name", "storyblok-app"))
 
-    # Build prompts
     system_prompt = build_system_prompt()
-    # include any provided followup_answers for context
     user_for_prompt = dict(user_answers)
     user_for_prompt.update({"followup_answers": followup_answers})
     user_prompt = build_user_prompt(user_for_prompt, schema, options)
 
     # ----------------------------
-    # Diagnostic: ask LLM if followups required
+    # Diagnostic / question generation
     # ----------------------------
-    diag_instruction = (
-        system_prompt
-        + "\n\n"
-        + user_prompt
-        + "\n\n"
-        "If you require additional clarifying questions from the user to produce a better scaffold, "
-        "respond with JSON exactly like: {\"followups\": ["
-        "{\"id\":\"q1\",\"question\":\"...\",\"type\":\"text\",\"default\":\"...\"}, ...] } "
-        "If no followups are required, respond with: {\"followups\": []}.\n"
-        "Respond only with valid JSON with that shape, no extra commentary."
-    )
-
-    # --- diagnostic / question-generation block (replace existing diag code) ---
     diag_parsed = None
     try:
-        # If the caller explicitly requests questions, instruct the LLM to produce up to N questions
         max_questions = int(options.get("max_questions", 3))
         request_questions = bool(options.get("request_questions", False))
 
         if request_questions:
-            # Ask the model to generate up to max_questions structured questions (type=text)
             q_instruction = (
                 system_prompt
                 + "\n\n"
                 + user_prompt
-                + f"\n\nYou are asked to produce up to {max_questions} structured clarifying questions "
-                "to gather requirements from the user. Return JSON exactly like: "
-                '{"followups":[{"id":"q1","question":"...","type":"text","default":"..."}, ...]} '
-                "If you think no clarifying questions are needed, return {\"followups\":[]}."
-                "Respond only with valid JSON of that shape."
+                + f"\n\nYou are asked to produce up to {max_questions} structured clarifying questions to gather requirements from the user. "
+                  'Return JSON exactly like: {"followups":[{"id":"q1","question":"...","type":"text","default":"..."}, ...]} '
+                  "If you think no clarifying questions are needed, return {\"followups\":[]}."
+                  "Respond only with valid JSON of that shape."
             )
             diag_parsed = await call_structured_generation(q_instruction, GenerateResponseModel, max_retries=1, timeout=30, debug=debug)
-            diag_parsed = _ensure_parsed_dict("diag_parsed", diag_parsed)
         else:
-            # Regular lightweight diagnostic: ask whether clarifying questions are required
             diag_instruction = (
                 system_prompt
                 + "\n\n"
                 + user_prompt
-                + "\n\nIf you require clarifying questions, respond with JSON exactly like: {\"followups\": [\"question1\", ...]} otherwise {\"followups\": []}."
+                + "\n\nIf you require clarifying questions, respond with JSON exactly like: {\"followups\": [\"question1\", ...]} otherwise {\"followups\": []}. "
                 "Respond only with valid JSON with that shape."
             )
             diag_parsed = await call_structured_generation(diag_instruction, GenerateResponseModel, max_retries=1, timeout=30, debug=debug)
-            diag_parsed = _ensure_parsed_dict("diag_parsed", diag_parsed)
     except Exception:
-        # diagnostic failed — continue to generation rather than block
         diag_parsed = None
 
-    # normalize followups if present
+    diag_parsed = _ensure_parsed_dict("diag_parsed", diag_parsed)
+
+    raw_followups = None
     if isinstance(diag_parsed, dict):
-        raw_followups = None
-        # prefer top-level 'followups', then metadata.followups
         if diag_parsed.get("followups"):
             raw_followups = diag_parsed.get("followups")
         elif diag_parsed.get("metadata") and isinstance(diag_parsed.get("metadata"), dict):
@@ -198,37 +312,34 @@ async def generate_project_files(payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             raw_followups = None
 
-        normalized = []
-        if isinstance(raw_followups, list) and len(raw_followups) > 0:
-            for item in raw_followups:
-                # keep the same _normalize_followup_item logic you already have
-                nf = _normalize_followup_item(item)
-                if nf and nf.get("question"):
-                    normalized.append(nf)
+    normalized = []
+    if isinstance(raw_followups, list) and len(raw_followups) > 0:
+        for item in raw_followups:
+            nf = _normalize_followup_item(item)
+            if nf and nf.get("question"):
+                normalized.append(nf)
 
-        # If request_questions was true, guarantee at least one fallback question if model returned none
-        if request_questions and not normalized:
-            normalized = [{
-                "id": f"q_{int(time.time()*1000)}",
-                "question": "Please list the key requirements for the app (pages, main features, and visual style).",
-                "type": "text",
-                "default": ""
-            }]
+    request_questions = bool(options.get("request_questions", False))
+    if request_questions and not normalized:
+        normalized = [{
+            "id": f"q_{int(time.time()*1000)}",
+            "question": "Please list the key requirements for the app (pages, main features, and visual style).",
+            "type": "text",
+            "default": ""
+        }]
 
-        # If followups found and there are no followup answers yet, return them as top-level followups
-        if normalized and (not followup_answers or len(followup_answers.keys()) == 0):
-            resp = {
-                "project_name": app_name,
-                "files": [],
-                "followups": normalized
-            }
-            if debug and diag_parsed is not None:
-                resp["llm_debug"] = diag_parsed
-            return resp
-
+    if normalized and (not followup_answers or len(followup_answers.keys()) == 0):
+        resp = {
+            "project_name": app_name,
+            "files": [],
+            "followups": normalized
+        }
+        if debug and diag_parsed is not None:
+            resp["llm_debug"] = diag_parsed
+        return resp
 
     # ----------------------------
-    # Generation: chunked by components (or single shot if no components)
+    # Generation
     # ----------------------------
     components = schema.get("components", []) or []
     generated_files: List[Dict[str, str]] = []
@@ -236,9 +347,9 @@ async def generate_project_files(payload: Dict[str, Any]) -> Dict[str, Any]:
     llm_debug_all = []
 
     if not components:
-        # Single-shot: generate entire project
         full_prompt = system_prompt + "\n" + user_prompt + "\n\nReturn JSON with project_name, files[], metadata."
         parsed = await call_structured_generation(full_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
+        parsed = _ensure_parsed_dict("full_gen", parsed)
         files = parsed.get("files", []) or []
         generated_files.extend(files)
         if parsed.get("metadata", {}).get("warnings"):
@@ -246,12 +357,12 @@ async def generate_project_files(payload: Dict[str, Any]) -> Dict[str, Any]:
         if debug:
             llm_debug_all.append(parsed)
     else:
-        # Process components in chunks to limit token usage
         for idx, chunk in enumerate(chunk_components(components, CHUNK_SIZE)):
             chunk_schema = {"components": chunk}
             chunk_user_prompt = build_user_prompt(user_for_prompt, chunk_schema, options)
             chunk_prompt = system_prompt + "\n" + chunk_user_prompt + "\n\nReturn JSON with files[] (only files for these components)."
             parsed = await call_structured_generation(chunk_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
+            parsed = _ensure_parsed_dict(f"chunk_{idx}_gen", parsed)
             files = parsed.get("files", []) or []
             generated_files.extend(files)
             if parsed.get("metadata", {}).get("warnings"):
@@ -259,9 +370,9 @@ async def generate_project_files(payload: Dict[str, Any]) -> Dict[str, Any]:
             if debug:
                 llm_debug_all.append(parsed)
 
-        # Final scaffold step (configs, pages, env, storyblok service)
         scaffold_prompt = system_prompt + "\n" + user_prompt + "\n\nNow produce project-level scaffolding files (package.json, tsconfig, vite.config, pages, services, env files). Return JSON with files[]."
         parsed_scaffold = await call_structured_generation(scaffold_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
+        parsed_scaffold = _ensure_parsed_dict("scaffold_gen", parsed_scaffold)
         scaffold_files = parsed_scaffold.get("files", []) or []
         generated_files.extend(scaffold_files)
         if parsed_scaffold.get("metadata", {}).get("warnings"):
@@ -270,7 +381,7 @@ async def generate_project_files(payload: Dict[str, Any]) -> Dict[str, Any]:
             llm_debug_all.append(parsed_scaffold)
 
     # ----------------------------
-    # Deduplicate & sanitize file list
+    # Deduplicate & sanitize
     # ----------------------------
     seen = set()
     sanitized_files: List[Dict[str, str]] = []
@@ -280,7 +391,6 @@ async def generate_project_files(payload: Dict[str, Any]) -> Dict[str, Any]:
             continue
         clean_p = os.path.normpath(p).lstrip(os.sep)
         if clean_p in seen:
-            # replace previous occurrence with later one
             for i, ex in enumerate(sanitized_files):
                 if os.path.normpath(ex["path"]).lstrip(os.sep) == clean_p:
                     sanitized_files[i] = {"path": clean_p, "content": f.get("content", "")}
@@ -288,6 +398,14 @@ async def generate_project_files(payload: Dict[str, Any]) -> Dict[str, Any]:
             continue
         seen.add(clean_p)
         sanitized_files.append({"path": clean_p, "content": f.get("content", "")})
+
+    # ----------------------------
+    # Dependency pinning (curated map + npm registry)
+    # ----------------------------
+    try:
+        sanitized_files, dep_meta = resolve_and_pin_dependencies(sanitized_files, options)
+    except Exception as e:
+        dep_meta = {"warnings": [f"dependency resolution failed: {e}"]}
 
     # ----------------------------
     # Optional validation (best-effort)
@@ -302,22 +420,20 @@ async def generate_project_files(payload: Dict[str, Any]) -> Dict[str, Any]:
                 target = Path(tmpdir) / f["path"]
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(f["content"], encoding="utf-8")
-
             res = run_tsc_check(tmpdir)
             validation_report["checked"] = True
             validation_report["ok"] = res.get("ok", False)
             validation_report["output"] = res.get("output", "")
             validation_report["skipped"] = res.get("skipped", False)
 
-            # Auto-retry on validation failure
             if not res.get("ok", False) and not res.get("skipped", False):
                 retries_left = LLM_RETRIES
                 repair_prompt = system_prompt + "\n" + user_prompt + "\n\nValidation output:\n" + res.get("output", "") + "\n\nPlease regenerate corrected files only in JSON {files: [...]} format."
                 while retries_left > 0:
                     try:
                         repaired = await call_structured_generation(repair_prompt, GenerateResponseModel, max_retries=1, timeout=TIMEOUT, debug=debug)
+                        repaired = _ensure_parsed_dict("repair_gen", repaired)
                         rep_files = repaired.get("files", []) or []
-                        # merge repaired files (overwrite)
                         for rf in rep_files:
                             rp = os.path.normpath(rf.get("path", "")).lstrip(os.sep)
                             replaced = False
@@ -328,7 +444,6 @@ async def generate_project_files(payload: Dict[str, Any]) -> Dict[str, Any]:
                                     break
                             if not replaced:
                                 sanitized_files.append({"path": rp, "content": rf.get("content", "")})
-                        # rewrite tmpdir and re-run tsc
                         for f in sanitized_files:
                             target = Path(tmpdir) / f["path"]
                             target.parent.mkdir(parents=True, exist_ok=True)
@@ -341,20 +456,24 @@ async def generate_project_files(payload: Dict[str, Any]) -> Dict[str, Any]:
                         else:
                             validation_report["output"] = res2.get("output", "")
                     except Exception:
-                        # swallow and continue retry loop
                         pass
                     retries_left -= 1
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
     # ----------------------------
-    # Final response
+    # Final response assembly
     # ----------------------------
     metadata = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "warnings": merged_warnings,
         "validation": validation_report
     }
+    # Merge dependency metadata if present
+    if 'dep_meta' in locals():
+        metadata.setdefault("dependencies", {}).update(dep_meta)
+    elif 'dep_meta' not in locals() and dep_meta:
+        metadata.setdefault("dependencies", {}).update(dep_meta)
 
     resp: Dict[str, Any] = {
         "project_name": app_name,
@@ -363,6 +482,6 @@ async def generate_project_files(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     if debug:
-        resp["llm_debug"] = {"chunks": llm_debug_all}
+        resp["llm_debug"] = {"chunks": llm_debug_all, "diag": diag_parsed}
 
     return resp
