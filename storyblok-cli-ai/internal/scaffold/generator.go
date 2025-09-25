@@ -222,3 +222,49 @@ func copyFile(src, dst string) error {
 	}
 	return nil
 }
+
+
+func WriteFilesAtomically(files []FileOut, projectDir string) error {
+	absTarget, err := filepath.Abs(projectDir)
+	if err != nil {
+		return err
+	}
+	if exists(absTarget) {
+		return &os.PathError{Op: "write", Path: absTarget, Err: os.ErrExist}
+	}
+
+	parent := filepath.Dir(absTarget)
+	tmp, err := os.MkdirTemp(parent, ".tmp-"+filepath.Base(absTarget)+"-")
+	if err != nil {
+		return err
+	}
+	// cleanup if any error and target does not exist
+	cleanup := func() {
+		_ = os.RemoveAll(tmp)
+	}
+	defer func() {
+		if !exists(absTarget) {
+			cleanup()
+		}
+	}()
+
+	// write files to tmp
+	for _, f := range files {
+		if err := writeFileToDir(tmp, f.Path, f.Content); err != nil {
+			return err
+		}
+	}
+
+	// try rename (atomic if same FS)
+	if err := os.Rename(tmp, absTarget); err == nil {
+		return nil
+	}
+	// fallback: copy recursively then remove tmp
+	if err := copyDir(tmp, absTarget); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(tmp); err != nil {
+		return err
+	}
+	return nil
+}

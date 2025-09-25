@@ -33,4 +33,4 @@ dist/
 .DS_Store # macOS
 Thumbs.db # Windows
 
-apptest
+test
