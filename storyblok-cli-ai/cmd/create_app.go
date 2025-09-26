@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -20,11 +22,98 @@ import (
 	"storyblok-cli-ai/internal/scaffold"
 )
 
+
 var createAppCmd = &cobra.Command{
 	Use:   "create",
 	Short: "Scaffold a React + Storyblok app (AI-powered)",
 	Long:  "Interactive wizard that scaffolds a React + Tailwind app integrated with Storyblok using the AI backend.",
 	Run: func(cmd *cobra.Command, args []string) {
+		// ---- Storyblok CLI integration (requirement, with validation) ----
+		// if err := scaffold.EnsureStoryblokCLI(); err != nil {
+		// 	printStructuredError(err)
+		// 	os.Exit(1)
+		// }
+
+		// // Attempt to read existing credentials
+		// creds, cErr := readStoryblokCredentials()
+		// if cErr != nil {
+		// 	// warn but continue to interactive login
+		// 	fmt.Fprintf(os.Stderr, "warning: failed to read Storyblok credentials: %v\n", cErr)
+		// }
+
+		// // Validate existing credentials if present, otherwise run login.
+		// maxLoginAttempts := 2
+		// attempt := 0
+		// credsValid := false
+
+		// for attempt < maxLoginAttempts {
+		// 	attempt++
+
+		// 	if creds == nil {
+		// 		fmt.Println("No Storyblok credentials found. Launching 'storyblok login' (interactive).")
+		// 		if err := runStoryblokLogin(); err != nil {
+		// 			// login failed to run (process error)
+		// 			printStructuredError(fmt.Errorf("storyblok login failed: %w", err))
+		// 			os.Exit(1)
+		// 		}
+		// 		// re-read creds after login
+		// 		creds, _ = readStoryblokCredentials()
+		// 		if creds == nil {
+		// 			// credentials file still missing; try again or abort
+		// 			fmt.Fprintf(os.Stderr, "storyblok credentials not found after login attempt %d\n", attempt)
+		// 			if attempt >= maxLoginAttempts {
+		// 				printStructuredError(fmt.Errorf("storyblok credentials not found after %d attempts; aborting", maxLoginAttempts))
+		// 				os.Exit(1)
+		// 			}
+		// 			// loop to attempt login again
+		// 			continue
+		// 		}
+		// 	}
+
+		// 	// If we have credentials, validate by calling `storyblok user`
+		// 	if err := validateStoryblokAuth(); err != nil {
+		// 		fmt.Fprintf(os.Stderr, "Storyblok credentials appear invalid: %v\n", err)
+		// 		// if we still have attempts left, prompt login
+		// 		if attempt < maxLoginAttempts {
+		// 			fmt.Println("Attempting interactive 'storyblok login' to refresh credentials...")
+		// 			if err := runStoryblokLogin(); err != nil {
+		// 				printStructuredError(fmt.Errorf("storyblok login failed: %w", err))
+		// 				os.Exit(1)
+		// 			}
+		// 			// re-read credentials after login and re-validate on next loop iteration
+		// 			creds, _ = readStoryblokCredentials()
+		// 			continue
+		// 		}
+		// 		// no attempts left -> abort
+		// 		printStructuredError(fmt.Errorf("storyblok credentials invalid after %d attempts; aborting", maxLoginAttempts))
+		// 		os.Exit(1)
+		// 	}
+
+		// 	// success
+		// 	credsValid = true
+		// 	break
+		// }
+
+		// if !credsValid {
+		// 	printStructuredError(fmt.Errorf("failed to validate Storyblok credentials; aborting"))
+		// 	os.Exit(1)
+		// }
+
+		// // Now attempt to pull components into a temp file and use as schema
+		// storyblokSchema, cleanupSchema := map[string]interface{}{}, func() {}
+		// if schema, cleanup, err := pullStoryblokComponentsTemp(); err == nil {
+		// 	storyblokSchema = schema
+		// 	cleanupSchema = cleanup
+		// 	fmt.Println("Pulled Storyblok components schema and will use it for scaffolding.")
+		// } else {
+		// 	fmt.Fprintf(os.Stderr, "warning: failed to pull Storyblok components: %v\n", err)
+		// 	// continue with empty schema (backend will ask followups)
+		// }
+		// // ensure temp schema cleanup when runCreateWizard returns
+		// defer cleanupSchema()
+		// // ---- end Storyblok CLI integration ----
+
+
 		if err := runCreateWizard(cmd); err != nil {
 			printStructuredError(err)
 			os.Exit(1)
@@ -226,7 +315,30 @@ func runCreateWizard(cmd *cobra.Command) error {
 		return fmt.Errorf("token prompt aborted: %w", err)
 	}
 	token = strings.TrimSpace(token)
+	// ---- Storyblok CLI integration (requirement) ----
+	if err := ensureStoryblokInstalled(); err != nil {
+		return fmt.Errorf("storyblok CLI required but missing: %w", err)
+	}
 
+	creds, cErr := readStoryblokCredentials()
+	if cErr != nil {
+		// we can still attempt interactive login
+		fmt.Fprintf(os.Stderr, "warning: failed to read Storyblok credentials: %v\n", cErr)
+	}
+
+	if creds == nil {
+		fmt.Println("No Storyblok credentials found. Launching 'storyblok login' (interactive).")
+		if err := runStoryblokLogin(); err != nil {
+			return fmt.Errorf("storyblok login failed: %w", err)
+		}
+		// attempt to read credentials again
+		creds, _ = readStoryblokCredentials()
+		if creds == nil {
+			// still none — abort because we require the CLI for this flow
+			return fmt.Errorf("storyblok credentials not found after login; aborting")
+		}
+	}
+	
 	// 2) Determine app name (slugify description). Allow user to edit name before proceeding.
 	defaultName := slugify(description)
 	var appName string
@@ -265,9 +377,10 @@ func runCreateWizard(cmd *cobra.Command) error {
 		"options": map[string]interface{}{
 			"typescript":    true,
 			"include_pages": true,
-			"debug":         true, // first run: enable debug to collect llm_debug for tuning
+			"debug":         true,
 		},
 	}
+
 
 	backendStreamURL := "http://127.0.0.1:8000/generate/stream"
 	backendURL := "http://127.0.0.1:8000/generate/"
@@ -587,6 +700,17 @@ func runCreateWizard(cmd *cobra.Command) error {
 		}
 
 		fmt.Println("Project created successfully at:", absTarget)
+		pkgPath := filepath.Join(absTarget, "package.json")
+		if _, err := os.Stat(pkgPath); err == nil {
+			fmt.Println("Detected package.json — generating Storyblok TypeScript types with 'storyblok types generate' ...")
+			if err := runStoryblokTypesGenerate(absTarget); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: storyblok types generate failed: %v\n", err)
+			} else {
+				fmt.Println("Storyblok TypeScript types generated successfully.")
+			}
+		} else {
+			fmt.Println("No package.json found — skipping Storyblok types generation.")
+		}
 		fmt.Println("\n⚠️  Security note:")
 		fmt.Println("  - A .env file containing your Storyblok token may have been written to the project root.")
 		fmt.Println("  - Do NOT commit .env to source control. .gitignore includes .env by default.")
@@ -610,4 +734,148 @@ func printStructuredError(err error) {
 	}
 	b, _ := json.MarshalIndent(out, "", "  ")
 	fmt.Fprintln(os.Stderr, string(b))
+}
+
+
+// ensureStoryblokInstalled returns nil if `storyblok` is available on PATH; otherwise returns an error
+func ensureStoryblokInstalled() error {
+	_, err := exec.LookPath("storyblok")
+	if err != nil {
+		return fmt.Errorf("storyblok CLI not found on PATH. Install via: npm install -g storyblok@beta (or see https://www.storyblok.com)")
+	}
+	return nil
+}
+
+// readStoryblokCredentials attempts to read ~/.storyblok/credentials.json and returns parsed JSON map
+// if the file doesn't exist, returns (nil, nil)
+func readStoryblokCredentials() (map[string]interface{}, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	credPath := filepath.Join(home, ".storyblok", "credentials.json")
+	if _, err := os.Stat(credPath); os.IsNotExist(err) {
+		return nil, nil
+	}
+	b, err := ioutil.ReadFile(credPath)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// runStoryblokLogin runs `storyblok login` interactively (attached to current stdio)
+func runStoryblokLogin() error {
+	cmd := exec.Command("storyblok", "login")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to run 'storyblok login': %w", err)
+	}
+	// small delay giving CLI time to write credentials
+	time.Sleep(300 * time.Millisecond)
+	return nil
+}
+
+// pullStoryblokComponentsTemp runs `storyblok components pull` in a temp dir, ensuring login first.
+// Returns parsed JSON schema, a cleanup func to remove temp dir, or error.
+func pullStoryblokComponentsTemp() (map[string]interface{}, func(), error) {
+	// Ensure we are authenticated (try validateStoryblokAuth, if fails, run login once)
+	if err := validateStoryblokAuth(); err != nil {
+		// not authenticated — run interactive login
+		fmt.Println("Storyblok CLI not authenticated. Launching 'storyblok login' (interactive).")
+		if err2 := runStoryblokLogin(); err2 != nil {
+			return nil, func() {}, fmt.Errorf("login failed: %w", err2)
+		}
+		// re-validate
+		if err3 := validateStoryblokAuth(); err3 != nil {
+			return nil, func() {}, fmt.Errorf("authentication failed after login: %w", err3)
+		}
+	}
+
+	// Create temp dir and run the pull command inside it so .storyblok/ is created there
+	tmpDir, err := ioutil.TempDir("", "storyblok_components_*")
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("failed to create temp dir: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(tmpDir) }
+
+	cmd := exec.Command("storyblok", "components", "pull")
+	cmd.Dir = tmpDir
+	// attach stdio so the command can be interactive / show progress if needed
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+
+	if err := cmd.Run(); err != nil {
+		// on failure, clean up and return the error
+		cleanup()
+		return nil, func() {}, fmt.Errorf("storyblok components pull failed: %w", err)
+	}
+
+	// find the generated file under tmpDir/.storyblok/
+	globPattern := filepath.Join(tmpDir, ".storyblok", "components.*.json")
+	matches, gerr := filepath.Glob(globPattern)
+	if gerr != nil || len(matches) == 0 {
+		// try to read entire .storyblok dir for debugging
+		_ = filepath.Walk(filepath.Join(tmpDir, ".storyblok"), func(p string, info os.FileInfo, e error) error {
+			if e == nil {
+				fmt.Fprintf(os.Stderr, "found file while scanning: %s\n", p)
+			}
+			return nil
+		})
+		cleanup()
+		return nil, func() {}, fmt.Errorf("could not find pulled components file (expected pattern %s)", globPattern)
+	}
+
+	// read the first match
+	b, err := os.ReadFile(matches[0])
+	if err != nil {
+		cleanup()
+		return nil, func() {}, fmt.Errorf("failed to read components file: %w", err)
+	}
+
+	var schema map[string]interface{}
+	if err := json.Unmarshal(b, &schema); err != nil {
+		cleanup()
+		return nil, func() {}, fmt.Errorf("failed to parse components JSON: %w", err)
+	}
+
+	return schema, cleanup, nil
+}
+
+
+// runStoryblokTypesGenerate runs `storyblok types generate` in the given project directory
+// and streams output to stdout/stderr. Caller receives error if command fails.
+func runStoryblokTypesGenerate(projectDir string) error {
+	cmd := exec.Command("storyblok", "types", "generate")
+	cmd.Dir = projectDir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	// attach stdin for safety
+	cmd.Stdin = os.Stdin
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("storyblok types generate failed: %w", err)
+	}
+	return nil
+}
+
+// validateStoryblokAuth runs a lightweight storyblok command to verify auth works.
+// It returns nil if credentials are valid, otherwise an error.
+func validateStoryblokAuth() error {
+	// `storyblok user` returns info about the current user when logged in; it fails if not authenticated.
+	cmd := exec.Command("storyblok", "user")
+	// We don't need to attach stdin; capture output for debugging
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// include output to aid debugging
+		return fmt.Errorf("storyblok auth validation failed: %v - output: %s", err, strings.TrimSpace(string(out)))
+	}
+	// If command succeeded, assume credentials are valid
+	return nil
 }
