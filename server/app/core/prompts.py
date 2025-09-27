@@ -119,6 +119,25 @@ def build_system_prompt(model_name: Optional[str] = None) -> str:
         f"{model_hint}\n"
     )
 
+def build_followup_system_prompt(model_name: Optional[str] = None) -> str:
+    """
+    System prompt specialized for generating follow-up questions only.
+    The followup agent's job: produce a concise list of natural-language
+    clarifying questions (strings) to resolve ambiguous or missing user requirements.
+    """
+    model_hint = f" Target model: {model_name}." if model_name else ""
+    return (
+        "You are an expert requirements elicitor for frontend projects wired to Storyblok.\n"
+        "Task:\n"
+        " - Ask concise, targeted, natural-language clarifying questions to gather user requirements and preferences.\n"
+        " - Return ONLY a single JSON object with one key: 'followups', whose value is a list of question strings.\n"
+        " - Do NOT return ids, types, files, dependencies, or any commentary — only JSON like: {\"followups\":[\"question1\",\"question2\",...]}.\n"
+        " - Produce between 5 and {max} follow-up questions (the caller requests the exact number); keep each question <= 140 characters.\n"
+        " - Focus on actionable items: pages, main features, auth, content mapping, component granularity, visual style, i18n, preview, and deployment.\n"
+        " - Keep questions natural and user-facing (e.g. 'Which pages do you need?') not developer-facing.\n"
+        f"{model_hint}\n"
+    )
+
 
 def _example_output_block() -> str:
     """Short example that demonstrates the expected JSON shape for followups and files."""

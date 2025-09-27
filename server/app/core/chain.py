@@ -262,6 +262,61 @@ async def _yield_event(event_type: str, payload: Any):
         # best-effort fallback
         return json.dumps({"event": "error", "payload": f"failed to serialize {event_type}"}) + "\n"
 
+async def generate_followup_questions(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Dedicated followup-question generator endpoint logic.
+    Expects payload: { user_answers, storyblok_schema, options }
+    Returns: {"followups": ["q1", "q2", ...]}
+    """
+    user_answers = payload.get("user_answers", {}) or {}
+    schema = payload.get("storyblok_schema", {}) or {}
+    options = payload.get("options", {}) or {}
+    debug = bool(options.get("debug", False))
+
+    # Ensure min questions requested is at least 5
+    try:
+        max_questions = int(options.get("max_questions", DIAGNOSTIC_MAX_QUESTIONS))
+    except Exception:
+        max_questions = DIAGNOSTIC_MAX_QUESTIONS
+    if max_questions < 5:
+        max_questions = 5
+
+    # Build prompt using the existing helper which produces a question-generation prompt
+    from core.prompts import build_question_generation_prompt, build_followup_system_prompt
+    system_prompt = build_followup_system_prompt()
+    q_prompt = build_question_generation_prompt(user_answers, schema, options)
+
+    # Call the LLM expecting a simple followups list
+    from core.llm_client import FollowupsListModel, call_structured_generation
+    try:
+        parsed = await call_structured_generation(q_prompt, FollowupsListModel, max_retries=1, timeout=30, debug=debug)
+    except Exception:
+        parsed = None
+
+    parsed = _ensure_parsed_dict("followup_gen", parsed)
+    raw = []
+    if isinstance(parsed, dict) and isinstance(parsed.get("followups"), list):
+        for it in parsed.get("followups", []):
+            if isinstance(it, str) and it.strip():
+                raw.append(it.strip())
+    # If LLM returned fewer than requested, pad with short natural questions to reach min (5)
+    desired = max_questions
+    if len(raw) < desired:
+        pads = [
+            "Which pages should the app include (e.g., home, about, blog, contact)?",
+            "List the core features required (search, auth, forms, ecommerce, CMS editing).",
+            "Do you want user authentication? If yes, what type (email, OAuth, SSO)?",
+            "Describe the visual style briefly (minimal, corporate, colorful, design system).",
+            "Preferred deployment target (Vercel, Netlify, other)?"
+        ]
+        for p in pads:
+            if len(raw) >= desired:
+                break
+            if p not in raw:
+                raw.append(p)
+
+    return {"followups": raw[:desired]}
+
 
 async def stream_generate_project(payload: Dict[str, Any]):
     """

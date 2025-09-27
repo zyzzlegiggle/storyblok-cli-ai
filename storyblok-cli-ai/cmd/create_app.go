@@ -406,30 +406,28 @@ func runCreateWizard(cmd *cobra.Command) error {
 		},
 	}
 
-	qResp, err := callBackend(backendURL, questionPayload)
+ 	qResp, err := callBackend(backendURL+"questions", questionPayload)	
 	if err != nil {
 		// non-fatal: continue to main loop (backend may not be available)
 		fmt.Fprintf(os.Stderr, "warning: question-generation failed: %v\n", err)
 	} else {
 		// extract top-level followups if any
-		var initialFollowups []map[string]interface{}
-		if fRaw, ok := qResp["followups"]; ok {
-			if arr, ok := fRaw.([]interface{}); ok {
-				for _, it := range arr {
-					if m, ok := it.(map[string]interface{}); ok {
-						initialFollowups = append(initialFollowups, m)
-					} else if s, ok := it.(string); ok {
-						initialFollowups = append(initialFollowups, map[string]interface{}{"id": "", "question": s, "type": "text", "default": ""})
-					}
-				}
-			}
-		}
-		// fallback: if backend didn't return followups, ask a generic question locally
-		if len(initialFollowups) == 0 {
-			initialFollowups = []map[string]interface{}{
-				{"id": "", "question": "Please list the key requirements for the app (pages, main features, and visual style).", "type": "text", "default": ""},
-			}
-		}
+        var initialFollowups []map[string]interface{}
+        if fRaw, ok := qResp["followups"]; ok {
+            if arr, ok := fRaw.([]interface{}); ok {
+                for _, it := range arr {
+                    if s, ok := it.(string); ok && strings.TrimSpace(s) != "" {
+                        initialFollowups = append(initialFollowups, map[string]interface{}{"id": "", "question": s, "type": "text", "default": ""})
+                    }
+                }
+            }
+        }
+        // Short generic prompt fallback (if backend returned zero followups)
+        if len(initialFollowups) == 0 {
+            initialFollowups = []map[string]interface{}{
+                {"id": "", "question": "Briefly describe the key requirements (pages, main features, visual style):", "type": "text", "default": ""},
+            }
+        }
 
 		// prompt the user for these generated questions (auto-fill from cache)
 		ansMap, err := promptFollowupsAndCollect(initialFollowups)

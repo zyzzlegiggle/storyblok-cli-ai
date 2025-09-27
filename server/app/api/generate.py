@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Any, Dict, Optional
 from fastapi.responses import StreamingResponse
+from core.chain import generate_followup_questions
 
 from core.chain import generate_project_files, stream_generate_project
 
@@ -38,5 +39,17 @@ async def generate_stream(req: GenerateRequest):
                 # stream_generate_project yields strings (JSON lines)
                 yield line.encode("utf-8")
         return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/questions", response_model=Dict[str, Any])
+async def generate_questions(req: GenerateRequest):
+    """
+    Dedicated followup-question endpoint.
+    Returns JSON: { "followups": ["q1", "q2", ...] }
+    """
+    try:
+        result = await generate_followup_questions(req.dict())
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

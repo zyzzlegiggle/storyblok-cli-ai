@@ -57,6 +57,11 @@ class GenerateResponseModel(BaseModel):
     metadata: Optional[MetadataModel] = Field(None, description="Optional metadata")
     llm_debug: Optional[LLMDebugModel] = Field(None, description="Optional debug info")
 
+# Simple model for followup-only responses: {"followups": ["q1","q2",...]}
+class FollowupsListModel(BaseModel):
+    followups: List[str] = Field(..., description="List of follow-up question strings")
+
+
 # -------------------------
 # LLM init + structured call
 # -------------------------
