@@ -246,13 +246,22 @@ func promptFollowupsAndCollect(followups []map[string]interface{}) (map[string]s
 		}
 
 		var resp string
-		if err := survey.AskOne(&survey.Input{
-			Message: question,
-			Default: defaultVal,
-		}, &resp); err != nil {
-			return nil, err
+		for {
+			if err := survey.AskOne(&survey.Input{
+				Message: question,
+				Default: defaultVal,
+			}, &resp); err != nil {
+				return nil, err
+			}
+			resp = strings.TrimSpace(resp)
+			// enforce non-empty answer (since you want natural text)
+			if resp == "" {
+				fmt.Println("Please provide a non-empty answer.")
+				continue
+			}
+			break
 		}
-		resp = strings.TrimSpace(resp)
+
 		answers[qid] = resp
 		cache[qid] = resp
 	}
@@ -260,6 +269,7 @@ func promptFollowupsAndCollect(followups []map[string]interface{}) (map[string]s
 	_ = saveCachedAnswers(cache)
 	return answers, nil
 }
+
 
 // convert backend files array -> scaffold.FileOut slice
 func parseFilesFromResponse(resp map[string]interface{}) []scaffold.FileOut {
@@ -391,7 +401,7 @@ func runCreateWizard(cmd *cobra.Command) error {
 		"storyblok_schema": payload["storyblok_schema"],
 		"options": map[string]interface{}{
 			"request_questions": true,
-			"max_questions":     3,
+			"max_questions":     5,
 			"debug":             payload["options"].(map[string]interface{})["debug"],
 		},
 	}

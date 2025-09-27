@@ -20,6 +20,7 @@ CHUNK_SIZE = int(os.environ.get("AI_CHUNK_SIZE", 10))
 LLM_RETRIES = int(os.environ.get("AI_RETRY_COUNT", 2))
 TIMEOUT = int(os.environ.get("AI_TIMEOUT", 180))
 LOG_DIR = os.environ.get("AI_BACKEND_LOG_DIR", "./ai_backend_logs")
+DIAGNOSTIC_MAX_QUESTIONS = int(os.environ.get("AI_DIAG_MAX_Q", 5))
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # ----------------------------
@@ -287,14 +288,36 @@ async def stream_generate_project(payload: Dict[str, Any]):
         request_questions = bool(options.get("request_questions", False))
 
         if request_questions:
+            # ensure we have an integer max_questions (bounded)
+            try:
+                max_questions = int(options.get("max_questions", DIAGNOSTIC_MAX_QUESTIONS))
+            except Exception:
+                max_questions = DIAGNOSTIC_MAX_QUESTIONS
+            if max_questions < 5:
+                max_questions = 5
+
+            # Strong, explicit instructions for the LLM to produce structured followups.
             q_instruction = (
                 system_prompt
                 + "\n\n"
                 + user_prompt
-                + f"\n\nYou are asked to produce up to {max_questions} structured clarifying questions to gather requirements from the user. "
-                  'Return JSON exactly like: {"followups":[{"id":"q1","question":"...","type":"text","default":"..."}, ...]} '
-                  "If you think no clarifying questions are needed, return {\"followups\":[]}."
-                  "Respond only with valid JSON of that shape."
+                + "\n\n"
+                "You are tasked with generating a concise set of structured clarifying questions to gather"
+                " detailed requirements from the user. **Produce between 5 and "
+                + str(max_questions)
+                + " follow-up questions** that will allow you to create a well-scoped frontend project."
+                " Focus on actionable items (pages, major features, auth, content structure, component granularity,"
+                " visual style, i18n, preview/auth, deployment). Avoid overly broad or ambiguous questions."
+                "\n\n"
+                "Return JSON exactly like:\n"
+                '{"followups":[{"id":"q1","question":"...","type":"text","default":"..."}, ...]}'
+                "\n\n"
+                "Notes and constraints for questions:\n"
+                " - Each followup must be short (<= 140 characters) and specific.\n"
+                " - Use types 'text', 'choice', or 'boolean' when appropriate. For 'choice', include a comma-separated default string if helpful.\n"
+                " - Provide stable 'id' keys (e.g., 'pages', 'auth', 'colors', 'components_count', 'deployment').\n"
+                " - If you think a question can be inferred from the user's initial description, still include it to confirm.\n"
+                " - Respond only with valid JSON of the specified shape (no extra commentary).\n"
             )
             diag_parsed = await call_structured_generation(q_instruction, GenerateResponseModel, max_retries=1, timeout=30, debug=debug)
         else:
@@ -328,13 +351,42 @@ async def stream_generate_project(payload: Dict[str, Any]):
                 normalized.append(nf)
 
     request_questions = bool(options.get("request_questions", False))
-    if request_questions and not normalized:
-        normalized = [{
-            "id": f"q_{int(time.time()*1000)}",
-            "question": "Please list the key requirements for the app (pages, main features, and visual style).",
-            "type": "text",
-            "default": ""
-        }]
+    # if we requested questions but LLM returned none or too few, generate a robust fallback set
+    if request_questions:
+        try:
+            desired = int(options.get("max_questions", DIAGNOSTIC_MAX_QUESTIONS))
+        except Exception:
+            desired = DIAGNOSTIC_MAX_QUESTIONS
+        if desired < 5:
+            desired = 5
+
+        # if normalized has fewer than desired, build helpful fallback questions
+        if not normalized or len(normalized) < desired:
+            base_questions = [
+                {"id": "pages", "question": "Which pages should the app include (e.g., home, blog, product, dashboard)?", "type": "text", "default": ""},
+                {"id": "features", "question": "List the main features the app needs (search, auth, CMS editing, forms, payments):", "type": "text", "default": ""},
+                {"id": "auth", "question": "Should the app include user authentication? If so, what type (email/password, OAuth, SSO)?", "type": "choice", "default": "no"},
+                {"id": "visual_style", "question": "Describe the visual style (minimal, corporate, colorful, design system or Tailwind):", "type": "text", "default": ""},
+                {"id": "components", "question": "How many distinct Storyblok components do you expect (e.g., header, footer, card, hero)?", "type": "text", "default": ""},
+                {"id": "i18n", "question": "Will the app need multiple languages (i18n)?", "type": "boolean", "default": "false"},
+                {"id": "preview", "question": "Do you want Storyblok live preview enabled in the app?", "type": "boolean", "default": "true"},
+                {"id": "deployment", "question": "Preferred deployment target (Vercel, Netlify, other):", "type": "choice", "default": "Vercel"},
+            ]
+            # start with any normalized items returned by LLM then append defaults to reach 'desired'
+            new_norm = []
+            if normalized:
+                new_norm.extend(normalized)
+            for q in base_questions:
+                if len(new_norm) >= desired:
+                    break
+                # ensure unique id
+                qcopy = dict(q) if False else None  # placeholder to avoid linting; we'll copy below
+            # Go-style safe append (no fancy copy code in Python): just append shallow copies
+            for q in base_questions:
+                if len(new_norm) >= desired:
+                    break
+                new_norm.append({"id": q["id"], "question": q["question"], "type": q["type"], "default": q["default"]})
+            normalized = new_norm
 
     # If followups are required, stream them and finish
     if normalized and (not followup_answers or len(followup_answers.keys()) == 0):

@@ -100,7 +100,7 @@ def summarize_schema(schema: Dict[str, Any],
 def build_system_prompt(model_name: Optional[str] = None) -> str:
     """
     System prompt instructing the model about output format and policies.
-    model_name is optional hint for model-specific behavior (e.g., 'gemini-2.5-flash-lite').
+    model_name is optional hint for model-specific behavior 
     """
     model_hint = f" Target model: {model_name}." if model_name else ""
     return (
