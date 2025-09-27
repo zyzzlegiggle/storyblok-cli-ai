@@ -3,9 +3,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Any, Dict, Optional
 from fastapi.responses import StreamingResponse
-from core.chain import generate_followup_questions
-
 from core.chain import generate_project_files, stream_generate_project
+from core.followup_agent import generate_followup_questions
 
 router = APIRouter()
 

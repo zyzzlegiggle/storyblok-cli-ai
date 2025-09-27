@@ -14,9 +14,9 @@ from typing import Any, Dict, List, Optional
 
 
 def summarize_schema(schema: Dict[str, Any],
-                     max_components: int = 20,
-                     max_fields: int = 12,
-                     max_chars: int = 3000) -> str:
+                     max_components: int = 12,
+                     max_fields: int = 8,
+                     max_chars: int = 1500) -> str:
     """
     Produce a concise textual summary of a Storyblok schema object.
     - schema: raw JSON from Storyblok (expected key 'components' or similar)
@@ -99,43 +99,38 @@ def summarize_schema(schema: Dict[str, Any],
 
 def build_system_prompt(model_name: Optional[str] = None) -> str:
     """
-    System prompt instructing the model about output format and policies.
-    model_name is optional hint for model-specific behavior 
+    System prompt for the main code-generation agent.
+    Clear, short rules to reduce accidental extra text.
     """
-    model_hint = f" Target model: {model_name}." if model_name else ""
     return (
-        "You are an expert code generator that creates React frontends wired to Storyblok.\n"
-        "CRITICAL:\n"
-        " - Respond ONLY with a single valid JSON object (no surrounding text, no backticks).\n"
-        " - Do NOT include any commentary, explanation, or extraneous keys.\n"
-        " - When asked for dependencies return package *names only* (no versions, no URLs) in a separate key called 'dependencies'.\n"
-        " - When generating follow-up questions return them in the 'followups' key as a list of objects with these fields:\n"
-        "     {\"id\": \"string\", \"question\": \"string\", \"type\": \"string\", \"required\": bool, \"choices\": [..]?, \"default\": ..?}\n"
-        "   Supported types: 'string', 'boolean', 'choice', 'multichoice'.\n"
-        " - If follow-ups are required, set 'files' to an empty list and return the questions in 'followups'.\n"
-        " - If you can generate code, return 'files' as a list of {path, content} objects where content is string-escaped source code.\n"
-        " - If you cannot produce everything due to token limits, still return partial 'files' plus 'warnings'.\n"
-        " - Always include a 'metadata' object with any notes, validations, or warnings.\n"
-        f"{model_hint}\n"
+        "You are an expert code generator producing React frontends wired to Storyblok.\n"
+        "OUTPUT RULES:\n"
+        " - Return EXACTLY one valid JSON object and nothing else.\n"
+        " - Top-level keys must include: project_name, files, dependencies, metadata, warnings, followups.\n"
+        " - 'files' is a list of {\"path\":\"relative/path\",\"content\":\"...\"}. Content must be a string.\n"
+        " - 'dependencies' is an ARRAY OF PACKAGE NAMES ONLY (no versions, no URLs).\n"
+        " - Keep files small and modular; prefer multiple small files over one huge file.\n"
+        " - Do NOT include secrets or tokens in files; reference env vars instead.\n"
+        f"\n"
     )
 
-def build_followup_system_prompt(model_name: Optional[str] = None) -> str:
+def build_followup_system_prompt(max_questions: int = 5, model_name: Optional[str] = None) -> str:
     """
     System prompt specialized for generating follow-up questions only.
-    The followup agent's job: produce a concise list of natural-language
-    clarifying questions (strings) to resolve ambiguous or missing user requirements.
+    Returns a short instruction the followup-only agent should follow.
     """
-    model_hint = f" Target model: {model_name}." if model_name else ""
     return (
-        "You are an expert requirements elicitor for frontend projects wired to Storyblok.\n"
-        "Task:\n"
-        " - Ask concise, targeted, natural-language clarifying questions to gather user requirements and preferences.\n"
-        " - Return ONLY a single JSON object with one key: 'followups', whose value is a list of question strings.\n"
-        " - Do NOT return ids, types, files, dependencies, or any commentary — only JSON like: {\"followups\":[\"question1\",\"question2\",...]}.\n"
-        " - Produce between 5 and {max} follow-up questions (the caller requests the exact number); keep each question <= 140 characters.\n"
-        " - Focus on actionable items: pages, main features, auth, content mapping, component granularity, visual style, i18n, preview, and deployment.\n"
-        " - Keep questions natural and user-facing (e.g. 'Which pages do you need?') not developer-facing.\n"
-        f"{model_hint}\n"
+        "You are a concise requirements elicitor for frontend projects wired to Storyblok.\n"
+        "OUTPUT RULES:\n"
+        " - Return ONLY a single JSON object with one key: 'followups', value is an ARRAY OF STRINGS.\n"
+        " - Do NOT return ids, types, files, dependencies, code, or any commentary.\n"
+        " - JSON must look exactly like: {\"followups\": [\"question 1\", \"question 2\", ...]}\n\n"
+        "QUESTION GUIDELINES:\n"
+        f" - Produce {max_questions} short, natural-language, user-facing clarifying questions (each <= 120 chars).\n"
+        " - Focus on actionable topics: pages, main features, auth, content mapping, component granularity,\n"
+        "   visual style, i18n, preview/auth, and deployment target.\n"
+        " - Prefer concrete, answerable prompts (e.g. 'Which pages do you need?') rather than developer-internal wording.\n\n"
+        f"\n"
     )
 
 
@@ -171,8 +166,8 @@ def build_question_generation_prompt(user_answers: Dict[str, Any],
                                      schema: Dict[str, Any],
                                      options: Dict[str, Any]) -> str:
     """
-    Build a prompt specifically for the diagnostic step where the LLM must
-    return structured follow-up questions if more information is required.
+    Build the followup-generation body (context + short task).
+    This is appended to the followup system prompt.
     """
     schema_summary = summarize_schema(schema)
     try:
@@ -182,38 +177,21 @@ def build_question_generation_prompt(user_answers: Dict[str, Any],
     opt_json = json.dumps(options or {}, indent=2)
 
     prompt = (
-        "You will only output valid JSON matching the structure shown in the EXAMPLE below.\n\n"
         "Context:\n"
-        f"User answers:\n{user_json}\n\n"
+        f"User description / answers:\n{user_json}\n\n"
         f"Storyblok schema summary:\n{schema_summary}\n\n"
         f"Options:\n{opt_json}\n\n"
         "Task:\n"
-        "  - Decide whether you need clarifying questions to generate a runnable scaffold.\n"
-        "  - If clarifying questions are needed, output JSON with 'followups' (list) and empty 'files'.\n"
-        "  - If no clarifying questions are needed, output 'followups': [] and proceed to include 'files'.\n\n"
-        "Followup format requirements:\n"
-        "  - Each followup must contain: id (string), question (string), type ('string'|'boolean'|'choice'|'multichoice'), required (bool).\n"
-        "  - For 'choice' or 'multichoice' provide a 'choices' array of strings and optionally 'default'.\n"
-        "  - Keep followups short and scoped to what is needed to produce the frontend (colors, layout, auth, pages, content mapping).\n\n"
-        "Dependency policy:\n"
-        "  - If referencing packages, use the 'dependencies' array to list package names ONLY (no versions, no commentary).\n\n"
-        "Example output (must follow this exact JSON schema):\n"
-        f"{_example_output_block()}\n\n"
-        "Now produce the JSON output required for this diagnostic step. Do NOT add any explanation or non-JSON text."
+        " - Based on the context above, decide what clarifying questions are required to produce a runnable frontend scaffold.\n"
+        " - If required, return questions in the 'followups' array (caller will request the number of questions).\n\n"
+        "Remember: output must be a single JSON object with key 'followups' (array of question strings)."
     )
     return prompt
 
 
 def build_user_prompt(user_answers: Dict[str, Any], schema: Dict[str, Any], options: Dict[str, Any]) -> str:
     """
-    Build the main generation prompt used when the backend is ready to generate files.
-    The model is expected to return a single JSON object with keys:
-      - project_name
-      - files: [{path, content}] (content must be string)
-      - dependencies: [package-name-only]
-      - metadata: { ... }
-      - warnings: [ ... ]
-      - followups: []   (should be empty when returning files)
+    Prompt body for the main generation step. Combined with build_system_prompt above.
     """
     schema_summary = summarize_schema(schema)
     try:
@@ -223,25 +201,16 @@ def build_user_prompt(user_answers: Dict[str, Any], schema: Dict[str, Any], opti
     opt_json = json.dumps(options or {}, indent=2)
 
     prompt = (
-        "You will ONLY respond with a single valid JSON object (no surrounding text).\n\n"
         "Context:\n"
         f"User requirements:\n{user_json}\n\n"
         f"Storyblok schema summary:\n{schema_summary}\n\n"
         f"Options:\n{opt_json}\n\n"
-        "Generation instructions and constraints:\n"
-        "1) Output JSON keys: project_name, files, dependencies, metadata, warnings, followups.\n"
-        "2) 'files' must be a list of objects: {\"path\": \"relative/path.ext\", \"content\": \"...source code...\"}.\n"
-        "   - Content must be string-escaped. Use TypeScript (TSX) for React components if options.typescript is true.\n        Otherwise use JavaScript/JSX.\n"
-        "3) 'dependencies' must be an array of package names only (e.g. ['next', 'react']). DO NOT include versions or comments.\n"
-        "4) Map each Storyblok component to a React component that accepts a 'blok' prop and renders fields.\n"
-        "5) Provide a minimal Tailwind setup and a storyblok client/service file that uses the Storyblok token if provided in user answers.\n"
-        "6) If options.include_pages is true, include at least a Home page and mapping to Storyblok content fetching.\n"
-        "7) If you cannot generate all files due to length, return as many complete files as possible and add explanatory warnings in 'metadata' and 'warnings'.\n"
-        "8) 'followups' must be an empty list here (this is the generation step); followups belong to the diagnostic question step.\n\n"
-        "Important: be conservative with large files — prefer smaller, readable files over huge single-file dumps.\n\n"
-        "Example of expected top-level JSON shape (abbreviated):\n"
-        '{"project_name":"my-app","files":[{"path":"pages/index.tsx","content":"..."}],"dependencies":["next","react"],'
-        '"metadata":{},"warnings":[],"followups":[]}\n\n'
-        "Now produce the JSON response. DO NOT include any commentary, only JSON."
+        "Generation instructions:\n"
+        " 1) Produce a runnable frontend scaffold (React + Storyblok) matching the user's requirements.\n"
+        " 2) Include minimal scaffolding files: package.json, build config, basic pages, Storyblok client, and representative components.\n"
+        " 3) Only list dependency NAMES in 'dependencies' (no versions).\n"
+        " 4) If any required information is missing, set 'followups' to a non-empty array (strings) and leave 'files' empty.\n"
+        " 5) If you cannot generate everything, return partial files and include a clear note in metadata.warnings.\n\n"
+        "Output: produce the single JSON object described by the system prompt. No extra text."
     )
     return prompt

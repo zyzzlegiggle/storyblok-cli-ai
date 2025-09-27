@@ -489,7 +489,6 @@ func runCreateWizard(cmd *cobra.Command) error {
 				fmt.Println("\n⚠️  Security note:")
 				fmt.Println("  - A .env file containing your Storyblok token may have been written to the project root.")
 				fmt.Println("  - Do NOT commit .env to source control. .gitignore includes .env by default.")
-				fmt.Println("  - If you prefer not to store the token, remove .env and set VITE_STORYBLOK_TOKEN in your environment.")
 				return nil
 			}
 
@@ -722,7 +721,6 @@ func runCreateWizard(cmd *cobra.Command) error {
 		fmt.Println("\n⚠️  Security note:")
 		fmt.Println("  - A .env file containing your Storyblok token may have been written to the project root.")
 		fmt.Println("  - Do NOT commit .env to source control. .gitignore includes .env by default.")
-		fmt.Println("  - If you prefer not to store the token, remove .env and set VITE_STORYBLOK_TOKEN in your environment.")
 		return nil
 	}
 

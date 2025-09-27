@@ -12,6 +12,8 @@ from typing import Dict, Any, List, Optional
 
 from core.llm_client import call_structured_generation, GenerateResponseModel
 from core.prompts import build_system_prompt, build_user_prompt
+# import followup agent (delegates followup-only logic)
+from core.followup_agent import generate_followup_questions
 
 # ----------------------------
 # Configuration / env overrides
