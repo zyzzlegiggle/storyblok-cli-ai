@@ -25,6 +25,7 @@ from typing import Dict, Any, List, Optional, AsyncGenerator
 from core.llm_client import call_structured_generation, GenerateResponseModel
 from core.prompts import build_system_prompt, build_user_prompt, summarize_schema
 from core.dep_resolver import resolve_and_pin_files
+from core.validator import run_validations, attempt_repair
 
 # configuration
 CHUNK_SIZE = int(os.environ.get("AI_CHUNK_SIZE", 10))
@@ -372,21 +373,45 @@ async def stream_generate_project(payload: Dict[str, Any]) -> AsyncGenerator[str
                 pass
 
             # optional TypeScript validation
+            # optional TypeScript validation using validator agent (with bounded repair)
             try:
                 validate = bool(options.get("validate", False))
                 if validate:
                     tmpdir = tempfile.mkdtemp(prefix="ai_gen_")
                     try:
+                        # write pinned files to temp workspace
                         for f in pinned_files:
                             target = Path(tmpdir) / f["path"]
                             target.parent.mkdir(parents=True, exist_ok=True)
                             target.write_text(f.get("content", ""), encoding="utf-8")
-                        res = run_tsc_check(tmpdir)
-                        yield await _yield_event("validation", res)
+
+                        # run configured validators (tsc)
+                        val_opts = {"validate_tsc": True}
+                        val_res = run_validations(tmpdir, val_opts)
+                        # emit validation result
+                        yield await _yield_event("validation", val_res)
+
+                        # if validation failed (and not skipped), attempt a single repair
+                        if val_res.get("checked") and val_res.get("ok") is False:
+                            # attempt one bounded repair via LLM
+                            repair_opts = {"user_answers": user_for_prompt, "debug": debug, "repair_attempts": 1}
+                            repair_res = await attempt_repair(tmpdir, val_res.get("output", ""), pinned_files, repair_opts)
+                            # emit repair event
+                            yield await _yield_event("repair", repair_res)
+
+                            # if repair applied, re-run validators
+                            if repair_res.get("ok"):
+                                val_res_after = run_validations(tmpdir, val_opts)
+                                yield await _yield_event("validation", val_res_after)
                     finally:
                         shutil.rmtree(tmpdir, ignore_errors=True)
-            except Exception:
-                pass
+            except Exception as e:
+                # emit warning if validation pipeline had an error
+                try:
+                    yield await _yield_event("warning", f"validation/repair pipeline error: {e}")
+                except Exception:
+                    pass
+
     except Exception:
         pass
 
@@ -493,56 +518,62 @@ async def generate_project(payload: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         dep_meta = {"warnings": [f"dependency resolution failed: {e}"]}
 
-    # optional validation (tsc)
+        # optional validation (tsc) using validator + repair agent
     validate = bool(options.get("validate", False))
     validation_report = {"checked": False, "ok": None, "output": "", "skipped": False}
+
     if validate:
         tmpdir = tempfile.mkdtemp(prefix="ai_gen_")
         try:
+            # write current sanitized files to tempdir
             for f in sanitized_files:
                 target = Path(tmpdir) / f["path"]
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(f["content"], encoding="utf-8")
-            res = run_tsc_check(tmpdir)
-            validation_report["checked"] = True
-            validation_report["ok"] = res.get("ok", False)
-            validation_report["output"] = res.get("output", "")
-            validation_report["skipped"] = res.get("skipped", False)
 
-            if not res.get("ok", False) and not res.get("skipped", False):
-                retries_left = LLM_RETRIES
-                repair_prompt = system_prompt + "\n" + user_prompt + "\n\nValidation output:\n" + res.get("output", "") + "\n\nPlease regenerate corrected files only in JSON {files: [...]} format."
-                while retries_left > 0:
-                    try:
-                        repaired = await call_structured_generation(repair_prompt, GenerateResponseModel, max_retries=1, timeout=TIMEOUT, debug=debug)
-                        repaired = _ensure_parsed_dict("repair_gen", repaired)
-                        rep_files = repaired.get("files", []) or []
-                        for rf in rep_files:
-                            rp = os.path.normpath(rf.get("path", "")).lstrip(os.sep)
-                            replaced = False
-                            for i, ex in enumerate(sanitized_files):
-                                if os.path.normpath(ex["path"]).lstrip(os.sep) == rp:
-                                    sanitized_files[i] = {"path": rp, "content": rf.get("content", "")}
-                                    replaced = True
-                                    break
-                            if not replaced:
-                                sanitized_files.append({"path": rp, "content": rf.get("content", "")})
-                        for f in sanitized_files:
-                            target = Path(tmpdir) / f["path"]
-                            target.parent.mkdir(parents=True, exist_ok=True)
-                            target.write_text(f["content"], encoding="utf-8")
-                        res2 = run_tsc_check(tmpdir)
-                        if res2.get("ok", False):
-                            validation_report["ok"] = True
-                            validation_report["output"] = res2.get("output", "")
+            # run validator agent
+            val_opts = {"validate_tsc": True}
+            val_res = run_validations(tmpdir, val_opts)
+            validation_report["checked"] = val_res.get("checked", False)
+            validation_report["ok"] = val_res.get("ok", None)
+            validation_report["output"] = val_res.get("output", "")
+            validation_report["skipped"] = val_res.get("skipped", False)
+
+            # if validation failed (and not skipped), attempt bounded LLM repair
+            if val_res.get("checked") and val_res.get("ok") is False:
+                repair_opts = {"user_answers": user_for_prompt, "debug": debug, "repair_attempts": 1}
+                repair_res = await attempt_repair(tmpdir, val_res.get("output", ""), sanitized_files, repair_opts)
+
+                # If repair provided files, merge them into sanitized_files (replace or append)
+                rep_files = repair_res.get("repaired_files", []) or []
+                for rf in rep_files:
+                    rp = os.path.normpath(rf.get("path", "")).lstrip(os.sep)
+                    replaced = False
+                    for i, ex in enumerate(sanitized_files):
+                        if os.path.normpath(ex["path"]).lstrip(os.sep) == rp:
+                            sanitized_files[i] = {"path": rp, "content": rf.get("content", "")}
+                            replaced = True
                             break
-                        else:
-                            validation_report["output"] = res2.get("output", "")
-                    except Exception:
-                        pass
-                    retries_left -= 1
+                    if not replaced:
+                        sanitized_files.append({"path": rp, "content": rf.get("content", "")})
+
+                # re-run validation after repair
+                for f in sanitized_files:
+                    target = Path(tmpdir) / f["path"]
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(f["content"], encoding="utf-8")
+                val_res_after = run_validations(tmpdir, val_opts)
+                validation_report["checked"] = val_res_after.get("checked", False)
+                validation_report["ok"] = val_res_after.get("ok", None)
+                validation_report["output"] = val_res_after.get("output", "")
+                validation_report["skipped"] = val_res_after.get("skipped", False)
+
+                # optionally attach repair summary in metadata.warnings if repair didn't succeed
+                if not validation_report.get("ok", False):
+                    validation_report.setdefault("repair", {}).update({"attempted": True, "report": repair_res})
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
 
     metadata = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),

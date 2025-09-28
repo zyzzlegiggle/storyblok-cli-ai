@@ -425,7 +425,7 @@ async def stream_generate_project(payload: Dict[str, Any]):
                 {"id": "auth", "question": "Should the app include user authentication? If so, what type (email/password, OAuth, SSO)?", "type": "choice", "default": "no"},
                 {"id": "visual_style", "question": "Describe the visual style (minimal, corporate, colorful, design system or Tailwind):", "type": "text", "default": ""},
                 {"id": "components", "question": "How many distinct Storyblok components do you expect (e.g., header, footer, card, hero)?", "type": "text", "default": ""},
-                {"id": "i18n", "question": "Will the app need multiple languages (i18n)?", "type": "boolean", "default": "false"},
+                {"id": "i18n", "question": "Will the app need multiple languages ()?", "type": "boolean", "default": "false"},
                 {"id": "preview", "question": "Do you want Storyblok live preview enabled in the app?", "type": "boolean", "default": "true"},
                 {"id": "deployment", "question": "Preferred deployment target (Vercel, Netlify, other):", "type": "choice", "default": "Vercel"},
             ]

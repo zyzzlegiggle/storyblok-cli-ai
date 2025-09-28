@@ -103,7 +103,7 @@ def build_system_prompt(model_name: Optional[str] = None) -> str:
     Clear, short rules to reduce accidental extra text.
     """
     return (
-        "You are an expert code generator producing React frontends wired to Storyblok.\n"
+        "You are an expert code generator producing React frontends wired to Storyblok with Tailwind styling.\n"
         "OUTPUT RULES:\n"
         " - Return EXACTLY one valid JSON object and nothing else.\n"
         " - Top-level keys must include: project_name, files, dependencies, metadata, warnings, followups.\n"
