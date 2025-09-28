@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Any, Dict, Optional
 from fastapi.responses import StreamingResponse
-from core.chain import generate_project_files, stream_generate_project
+from core.codegen_agent import generate_project, stream_generate_project
 from core.followup_agent import generate_followup_questions
 
 router = APIRouter()
@@ -16,7 +16,7 @@ class GenerateRequest(BaseModel):
 @router.post("/", response_model=Dict[str, Any])
 async def generate(req: GenerateRequest):
     try:
-        result = await generate_project_files(req.dict())
+        result = await generate_project(req.dict())
         return result
     except Exception as e:
         # Save stacktrace to logs for debugging
