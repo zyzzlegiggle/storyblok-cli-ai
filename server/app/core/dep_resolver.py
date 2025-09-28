@@ -78,6 +78,7 @@ def _resolve_with_npm(deps: Dict[str, str]) -> Dict[str, Any]:
         pj.write_text(json.dumps(pkg), encoding="utf-8")
 
         # run npm install --package-lock-only for deterministic lock generation
+        print("npm path:", shutil.which("npm"))
         cmd = ["npm", "install", "--package-lock-only", "--no-audit", "--no-fund"]
         proc = subprocess.run(cmd, cwd=td, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
         out = proc.stdout or ""
