@@ -288,7 +288,7 @@ func runCreateWizard(cmd *cobra.Command) error {
 		"storyblok_schema": payload["storyblok_schema"],
 		"options": map[string]interface{}{
 			"request_questions": true,
-			"max_questions":     7,
+			"max_questions":     5,
 			"debug":             payload["options"].(map[string]interface{})["debug"],
 		},
 	}

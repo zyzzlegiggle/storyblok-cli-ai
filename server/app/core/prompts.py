@@ -127,39 +127,11 @@ def build_followup_system_prompt(max_questions: int = 5, model_name: Optional[st
         " - JSON must look exactly like: {\"followups\": [\"question 1\", \"question 2\", ...]}\n\n"
         "QUESTION GUIDELINES:\n"
         f" - Produce {max_questions} short, natural-language, user-facing clarifying questions (each <= 120 chars).\n"
-        " - Focus on actionable topics: pages, main features, auth, content mapping, component granularity,\n"
-        "   visual style, i18n, preview/auth, and deployment target.\n"
+        " - Focus on actionable topics: pages, main features, content mapping, component granularity,\n"
+        "   visual style, theme, colors\n"
         " - Prefer concrete, answerable prompts (e.g. 'Which pages do you need?') rather than developer-internal wording.\n\n"
         f"\n"
     )
-
-
-def _example_output_block() -> str:
-    """Short example that demonstrates the expected JSON shape for followups and files."""
-    example = {
-        "project_name": "my-app",
-        "followups": [
-            {
-                "id": "primary_color",
-                "question": "What is the primary brand color (hex or tailwind token)?",
-                "type": "string",
-                "required": True,
-                "default": "#0ea5e9"
-            },
-            {
-                "id": "include_auth",
-                "question": "Should the scaffold include authentication (signup/login)?",
-                "type": "boolean",
-                "required": True,
-                "default": False
-            }
-        ],
-        "files": [],
-        "dependencies": ["next", "react", "react-dom", "tailwindcss", "@storyblok/react"],
-        "metadata": {"notes": "Returned followups because user asked for clarifications."},
-        "warnings": []
-    }
-    return json.dumps(example, indent=2)
 
 
 def build_question_generation_prompt(user_answers: Dict[str, Any],
