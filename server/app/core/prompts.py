@@ -138,10 +138,9 @@ def build_question_generation_prompt(user_answers: Dict[str, Any],
                                      schema: Dict[str, Any],
                                      options: Dict[str, Any]) -> str:
     """
-    Build the followup-generation body (context + short task).
-    This is appended to the followup system prompt.
-    Now supports iterative rounds by reading options['round_number'] and
-    options['prev_followup_answers'] (same structure as user_answers['followup_answers']).
+    Build the followup-generation prompt. Now explicitly includes previous followups
+    and their answers (id->question->answer), and instructs the model to base next
+    questions on those answers and NOT to repeat the same questions.
     """
     schema_summary = summarize_schema(schema)
     try:
@@ -151,8 +150,11 @@ def build_question_generation_prompt(user_answers: Dict[str, Any],
     opt_json = json.dumps(options or {}, indent=2)
 
     round_num = (options.get("round_number") if options and isinstance(options, dict) else None) or 1
+
+    # Extract previous followup answers mapping if present
     prev_fanswers = {}
     if isinstance(user_answers, dict):
+        # expected shape: user_answers["followup_answers"] is map[id] = value
         prev_fanswers = user_answers.get("followup_answers", {}) or {}
 
     try:
@@ -160,20 +162,32 @@ def build_question_generation_prompt(user_answers: Dict[str, Any],
     except Exception:
         prev_json = str(prev_fanswers)
 
-    prompt = (
-        "Context:\n"
-        f"User description / answers:\n{user_json}\n\n"
-        f"Storyblok schema summary:\n{schema_summary}\n\n"
-        f"Previous followup answers (round {round_num}):\n{prev_json}\n\n"
-        f"Options:\n{opt_json}\n\n"
-        "Task:\n"
-        " - Based on the context above and the previous answers, produce follow-up questions that *add new, necessary detail*.\n"
-        " - Avoid repeating or re-asking questions already answered in 'Previous followup answers'.\n"
-        " - Prioritize missing-critical information required to produce a runnable scaffold (pages, content mapping, auth, routing, i18n, deployment target, styling tokens).\n"
-        " - If no additional clarifying questions are required, return an empty 'followups' array.\n\n"
-        "Remember: output must be a single JSON object with key 'followups' (array of question strings)."
-    )
-    return prompt
+    prompt_lines = [
+        "Context:",
+        f"User description / answers:\n{user_json}",
+        "",
+        f"Storyblok schema summary:\n{schema_summary}",
+        "",
+        f"Previous followup answers (round {round_num}):\n{prev_json}",
+        "",
+        f"Options:\n{opt_json}",
+        "",
+        "Task:",
+        "- You will propose additional clarifying follow-up questions that *build on the user's previous answers*.",
+        "- DO NOT repeat prior questions. Prior questions and their answers are provided above (id -> answer).",
+        "- Where possible, reference prior answers to drill down. E.g. if the user answered 'auth: email', ask 'Do you want email+password or magic links?'.",
+        "- Return only new, actionable questions that are necessary to produce a runnable scaffold.",
+        "- For each followup, return an OBJECT with keys: 'id' (short identifier — optional, but prefer stable ids),",
+        "  'question' (the user-facing question string), and optional 'urgency' (0.0-1.0).",
+        "- If there are no further clarifications needed, return an empty 'followups' array.",
+        "",
+        "OUTPUT RULES:",
+        "Return a single JSON object exactly like: {\"followups\":[{\"id\":\"...\",\"question\":\"...\",\"urgency\":0.8}, ...]}",
+        "Followups may also be simple strings (for compatibility), but prefer the object form.",
+    ]
+
+    return "\n".join(prompt_lines)
+
 
 def build_user_prompt(user_answers: Dict[str, Any], schema: Dict[str, Any], options: Dict[str, Any]) -> str:
     """

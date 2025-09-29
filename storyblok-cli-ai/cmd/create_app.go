@@ -3,6 +3,8 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -216,6 +218,7 @@ func readJSONLine(r *bufio.Reader) ([]byte, error) {
 }
 
 // ---------------- Main wizard ----------------
+var qResp map[string]interface{}
 
 func runCreateWizard(cmd *cobra.Command) error {
 	// 1) Single freeform prompt + token prompt
@@ -282,37 +285,70 @@ func runCreateWizard(cmd *cobra.Command) error {
 	backendStreamURL := "http://127.0.0.1:8000/generate/stream"
 	backendURL := "http://127.0.0.1:8000/generate/"
 
-	// --- New: ask backend to generate structured requirements questions (guarantee at least one) ---
-	// --- Iterative question-generation rounds (replaces the single-question block) ---
-	maxFollowupRounds := 2 // number of rounds (you asked for 2 rounds of 5 questions each)
-	roundQuestions := 5    // questions per round
+	// --- before the iterative rounds, declare helpers/state ---
+	questionTexts := map[string]string{} // id -> question text
+	currentRound := 0
+	// --- Iterative question-generation rounds with smart stopping & UI preview ---
+	maxFollowupRounds := 2 // number of rounds
+	roundQuestions := 5    // requested per round
+	urgencyThreshold := 0.25
+	askedQuestions := []string{} // normalized previously asked question texts
+
+	// helper to normalize
+	normalize := func(s string) string {
+		// lower + collapse whitespace
+		return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(s))), " ")
+	}
 
 	for round := 1; round <= maxFollowupRounds; round++ {
-		// build payload for question generation; include current followup_answers so LLM can build on them
+		// UI preview: show previous followup answers to the user
+		userAns, _ := payload["user_answers"].(map[string]interface{})
+		fmt.Printf("\n--- Round %d followups ---\n", round)
+		if userAns != nil {
+			if fa, ok := userAns["followup_answers"].(map[string]interface{}); ok && len(fa) > 0 {
+				fmt.Println("Previous answers (summary):")
+				count := 0
+				for k, v := range fa {
+					if count >= 6 { // keep preview short
+						fmt.Println("  ...")
+						break
+					}
+					fmt.Printf("  - %s: %v\n", k, v)
+					count++
+				}
+			} else {
+				fmt.Println("No previous followup answers.")
+			}
+		}
+
+		// Build payload including previous_questions so backend can avoid repeats
 		qPayload := map[string]interface{}{
 			"user_answers":     payload["user_answers"],
 			"storyblok_schema": payload["storyblok_schema"],
 			"options": map[string]interface{}{
-				"request_questions": true,
-				"max_questions":     roundQuestions,
-				"round_number":      round,
-				"debug":             payload["options"].(map[string]interface{})["debug"],
+				"request_questions":  true,
+				"max_questions":      roundQuestions,
+				"round_number":       round,
+				"debug":              payload["options"].(map[string]interface{})["debug"],
+				"previous_questions": askedQuestions,
+				"min_urgency":        urgencyThreshold,
+				"pad":                true,
 			},
 		}
 
-		qResp, err := callBackend(backendURL+"questions", qPayload)
+		qResp, err = callBackend(backendURL+"questions", qPayload)
 		if err != nil {
-			// non-fatal: on first round, fall back to a single generic prompt; else continue
 			fmt.Fprintf(os.Stderr, "warning: question-generation failed (round %d): %v\n", round, err)
+			// fallback to generic prompt only on first round
 			if round == 1 {
-				fallback := []map[string]interface{}{
+				initialFollowups := []map[string]interface{}{
 					{"id": "", "question": "Briefly describe the key requirements (pages, main features, visual style):", "type": "text", "default": ""},
 				}
-				ansMap, err := promptFollowupsAndCollect(fallback)
+				ansMap, err := promptFollowupsAndCollect(initialFollowups)
 				if err != nil {
 					return fmt.Errorf("aborted while answering initial requirements: %w", err)
 				}
-				// attach answers and continue to next round (or finish if maxFollowupRounds==1)
+				// attach and continue
 				userAns, _ := payload["user_answers"].(map[string]interface{})
 				if userAns == nil {
 					userAns = map[string]interface{}{}
@@ -326,39 +362,103 @@ func runCreateWizard(cmd *cobra.Command) error {
 				}
 				userAns["followup_answers"] = existing
 				payload["user_answers"] = userAns
-				continue
 			}
-			// if backend failed mid-rounds, break out and continue flow
+			// if backend failed mid-rounds, just break and proceed
 			break
 		}
 
-		// extract followups
+		// Parse followups — accept both objects and strings
 		currentFollowups := []map[string]interface{}{}
 		if fRaw, ok := qResp["followups"]; ok {
 			if arr, ok := fRaw.([]interface{}); ok {
-				for _, it := range arr {
+				for idx, it := range arr {
 					if m, ok := it.(map[string]interface{}); ok {
-						currentFollowups = append(currentFollowups, m)
-					} else if s, ok := it.(string); ok && strings.TrimSpace(s) != "" {
-						currentFollowups = append(currentFollowups, map[string]interface{}{"id": "", "question": s, "type": "text", "default": ""})
+						qtext, _ := m["question"].(string)
+						if strings.TrimSpace(qtext) == "" {
+							continue
+						}
+						qid, _ := m["id"].(string)
+						if qid == "" {
+							qid = stableIDForQuestion(round, idx, qtext)
+						}
+						// save text mapping
+						questionTexts[qid] = qtext
+						// urgency parse
+						urg := 0.5
+						if u, ok := m["urgency"].(float64); ok {
+							urg = u
+						} else if u2, ok := m["urgency"].(int); ok {
+							urg = float64(u2)
+						}
+						currentFollowups = append(currentFollowups, map[string]interface{}{"id": qid, "question": qtext, "urgency": urg})
+					} else if s, ok := it.(string); ok {
+						if strings.TrimSpace(s) != "" {
+							qid := stableIDForQuestion(round, idx, s)
+							questionTexts[qid] = s
+							currentFollowups = append(currentFollowups, map[string]interface{}{"id": qid, "question": s, "urgency": 0.5})
+						}
 					}
 				}
 			}
 		}
 
-		// if no new followups, stop early
-		if len(currentFollowups) == 0 {
+		// Filter out already asked questions (by normalized text) and low-urgency ones
+		filteredFollowups := []map[string]interface{}{}
+		for _, fu := range currentFollowups {
+			qtxt, _ := fu["question"].(string)
+			n := normalize(qtxt)
+			// skip duplicates
+			already := false
+			for _, aq := range askedQuestions {
+				if aq == n {
+					already = true
+					break
+				}
+			}
+			if already {
+				continue
+			}
+			// skip low urgency
+			urg := 0.5
+			if u, ok := fu["urgency"].(float64); ok {
+				urg = u
+			}
+			if urg < urgencyThreshold {
+				continue
+			}
+			filteredFollowups = append(filteredFollowups, fu)
+		}
+
+		// If nothing remains after filtering, smart stop
+		if len(filteredFollowups) == 0 {
+			fmt.Println("No additional high-priority follow-up questions were generated. Continuing.")
 			break
 		}
 
-		// prompt the user for this round's followups
-		ansMap, err := promptFollowupsAndCollect(currentFollowups)
+		// Prompt user for the remaining followups (convert to expected map shape)
+		toPrompt := []map[string]interface{}{}
+		for _, fu := range filteredFollowups {
+			qid := ""
+			if idv, ok := fu["id"].(string); ok {
+				qid = idv
+			}
+			toPrompt = append(toPrompt, map[string]interface{}{"id": qid, "question": fu["question"].(string), "type": "text", "default": ""})
+		}
+
+		// record askedQuestions so future rounds don't repeat
+		for _, fu := range filteredFollowups {
+			if qtxt, ok := fu["question"].(string); ok {
+				askedQuestions = append(askedQuestions, normalize(qtxt))
+			}
+		}
+
+		ansMap, err := promptFollowupsAndCollect(toPrompt)
 		if err != nil {
 			return fmt.Errorf("aborted while answering followups (round %d): %w", round, err)
 		}
 
 		// merge answers into payload.user_answers.followup_answers
-		userAns, _ := payload["user_answers"].(map[string]interface{})
+		userAns, _ = payload["user_answers"].(map[string]interface{})
 		if userAns == nil {
 			userAns = map[string]interface{}{}
 		}
@@ -372,13 +472,13 @@ func runCreateWizard(cmd *cobra.Command) error {
 		userAns["followup_answers"] = existing
 		payload["user_answers"] = userAns
 
-		// loop to next round (backend will see updated followup_answers)
+		// continue to next round (backend will be posted again with updated followup_answers)
 	}
-	// --- end iterative followup rounds ---
 
 	// 5) followup loop
 	maxRounds := 20
-	for round := 0; round < maxRounds; round++ {
+	for round := 1; round < maxRounds; round++ {
+		currentRound = round
 		// call streaming endpoint to get progress + files
 		resp, err := callBackendStream(backendStreamURL, payload)
 		if err != nil {
@@ -462,51 +562,67 @@ func runCreateWizard(cmd *cobra.Command) error {
 		var pb *progressbar.ProgressBar
 		generatedCount := 0
 
-		handleFollowups := func(followupsIface interface{}) (bool, error) {
+		handleFollowups := func(followupsIface interface{}, round int) (bool, error) {
 			// convert to []map[string]interface{}
 			out := []map[string]interface{}{}
 			if arr, ok := followupsIface.([]interface{}); ok {
-				for _, it := range arr {
+				for idx, it := range arr {
 					if m, ok := it.(map[string]interface{}); ok {
-						out = append(out, m)
+						qtext, _ := m["question"].(string)
+						if strings.TrimSpace(qtext) == "" {
+							continue
+						}
+						qid, _ := m["id"].(string)
+						if qid == "" {
+							qid = stableIDForQuestion(round, idx, qtext)
+						}
+						questionTexts[qid] = qtext
+						out = append(out, map[string]interface{}{"id": qid, "question": qtext, "type": "text", "default": ""})
 					} else if s, ok := it.(string); ok {
-						out = append(out, map[string]interface{}{"id": "", "question": s, "type": "text", "default": ""})
+						if strings.TrimSpace(s) == "" {
+							continue
+						}
+						qid := stableIDForQuestion(round, idx, s)
+						questionTexts[qid] = s
+						out = append(out, map[string]interface{}{"id": qid, "question": s, "type": "text", "default": ""})
 					}
 				}
 			}
+
 			if len(out) == 0 {
 				return false, nil
 			}
+
 			// close stream body and prompt user
 			_ = resp.Body.Close()
+
 			ansMap, err := promptFollowupsAndCollect(out)
 			if err != nil {
 				return false, err
 			}
+
 			// attach answers and break to outer loop
 			userAns, _ := payload["user_answers"].(map[string]interface{})
 			if userAns == nil {
 				userAns = map[string]interface{}{}
 			}
-			existing := map[string]string{}
-			if fa, ok := userAns["followup_answers"].(map[string]string); ok {
+			existing := map[string]interface{}{}
+			if fa, ok := userAns["followup_answers"].(map[string]interface{}); ok {
 				existing = fa
-			} else if fa2, ok := userAns["followup_answers"].(map[string]interface{}); ok {
-				for k, v := range fa2 {
-					if s, ok := v.(string); ok {
-						existing[k] = s
-					}
-				}
 			}
 			for k, v := range ansMap {
 				existing[k] = v
 			}
-			faInterface := map[string]interface{}{}
-			for k, v := range existing {
-				faInterface[k] = v
-			}
-			userAns["followup_answers"] = faInterface
+			userAns["followup_answers"] = existing
 			payload["user_answers"] = userAns
+
+			// also add these asked question texts to askedQuestions so iterative rounds avoid repeats
+			for _, it := range out {
+				if qtxt, ok := it["question"].(string); ok {
+					askedQuestions = append(askedQuestions, normalize(qtxt))
+				}
+			}
+
 			return true, nil
 		}
 
@@ -532,7 +648,7 @@ func runCreateWizard(cmd *cobra.Command) error {
 			switch etype {
 			case "followups":
 				// backend requests clarifying questions: prompt user then continue outer loop
-				shouldContinue, err := handleFollowups(payloadEv)
+				shouldContinue, err := handleFollowups(payloadEv, currentRound)
 				if err != nil {
 					return fmt.Errorf("error while handling followups: %w", err)
 				}
@@ -663,12 +779,7 @@ func runCreateWizard(cmd *cobra.Command) error {
 		}
 
 		fmt.Println("Project created successfully at:", absTarget)
-		pkgPath := filepath.Join(absTarget, "package.json")
-		if _, err := os.Stat(pkgPath); err == nil {
 
-		} else {
-			fmt.Println("No package.json found — skipping Storyblok types generation.")
-		}
 		fmt.Println("\n⚠️  Security note:")
 		fmt.Println("  - A .env file containing your Storyblok token may have been written to the project root.")
 		fmt.Println("  - Do NOT commit .env to source control. .gitignore includes .env by default.")
@@ -720,4 +831,11 @@ func runFormatterForFile(path string) error {
 		}
 	}
 	return nil
+}
+
+// helper
+func stableIDForQuestion(round int, index int, question string) string {
+	// prefer hash of question for stability across runs
+	h := md5.Sum([]byte(strings.ToLower(strings.TrimSpace(question))))
+	return fmt.Sprintf("r%d_q%d_%s", round, index, hex.EncodeToString(h[:4])) // short hash
 }
