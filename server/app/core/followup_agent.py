@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from core.prompts import build_question_generation_prompt, build_followup_system_prompt
 from core.llm_client import call_structured_generation, FollowupsListModel
-from app.utils.config import AGENT_TEMPERATURES
+from utils.config import AGENT_TEMPERATURES
 
 # Small, forgiving parser for structured LLM outputs
 def _parse_followups(raw) -> List[str]:

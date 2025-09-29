@@ -28,7 +28,7 @@ from core.prompts import build_system_prompt, build_user_prompt, summarize_schem
 from core.dep_resolver import resolve_and_pin_files
 from core.validator import run_validations, attempt_repair
 from core.followup_agent import generate_followup_questions  # localized import
-from app.utils.config import AGENT_TEMPERATURES
+from utils.config import AGENT_TEMPERATURES
 
 # configuration
 CHUNK_SIZE = int(os.environ.get("AI_CHUNK_SIZE", 10))
@@ -362,7 +362,7 @@ async def generate_project(payload: Dict[str, Any]) -> Dict[str, Any]:
             if debug:
                 llm_debug_all.append(parsed)
 
-        scaffold_prompt = system_prompt + "\n" + user_prompt + "\n\nNow produce project-level scaffolding files (package.json, tsconfig, vite.config, pages, services, env files). Return JSON with files[]."
+        scaffold_prompt = system_prompt + "\n" + user_prompt + "\n\nNow produce project-level scaffolding files (package.json, tsconfig, pages, services, env files, etc.). Return JSON with files[]."
         parsed_scaffold = await call_structured_generation(scaffold_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
         parsed_scaffold = _ensure_parsed_dict("scaffold_gen", parsed_scaffold)
         scaffold_files = parsed_scaffold.get("files", []) or []
