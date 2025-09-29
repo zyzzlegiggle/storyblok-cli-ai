@@ -176,7 +176,7 @@ def resolve_and_pin(deps: Dict[str, str], language: str = "js") -> Dict[str, Any
         return {"pinned": {}, "lockfile": {"type": "none", "content": None}, "warnings": []}
 
     # Prefer npm resolution for JS/TS projects if npm exists
-    if language in ("js", "ts", "node") and _npm_available():
+    if language in ("js", "ts", "node", "tsx") and _npm_available():
         res = _resolve_with_npm(deps)
         # if npm failed to produce pins for many packages, fallback to registry for missing entries
         missing = [n for n in deps.keys() if n not in res.get("pinned", {})]
@@ -224,10 +224,42 @@ def resolve_and_pin_files(files: List[Dict[str, str]], options: Dict[str, Any]) 
     if options and isinstance(options, dict) and options.get("language"):
         language = options.get("language")
 
-    res = resolve_and_pin(collected, language=language)
-    pinned = res.get("pinned", {}) or {}
-    warnings = res.get("warnings", []) or []
-    lockfile = res.get("lockfile", {})
+        # Prefer npm lockfile resolution when possible (deterministic)
+    pinned = {}
+    warnings = []
+    lockfile = {"type": "none", "content": None}
+
+    try:
+        if language in ("js", "ts", "node", "tsx") and _npm_available():
+            # Attempt to run `npm install --package-lock-only` using the full package.json
+            npm_res = resolve_with_npm_lockfile_fully(pkg_obj, list(collected.keys()))
+            if npm_res.get("ok"):
+                pinned = npm_res.get("pinned", {}) or {}
+                lockfile = {"type": "package-lock", "content": npm_res.get("lockfile")}
+                warnings.extend(npm_res.get("warnings", []) or [])
+            else:
+                # record npm error, will fallback to registry for all packages
+                warnings.append(f"npm lockfile resolution failed: {npm_res.get('error', 'unknown')}")
+        # For any missing packages (or if npm not available), use registry fallback (semver-aware if implemented)
+        missing = [n for n in collected.keys() if n not in pinned]
+        if missing:
+            reg_res = _resolve_with_registry({n: collected.get(n) for n in missing})
+            pinned.update(reg_res.get("pinned", {}) or {})
+            warnings.extend(reg_res.get("warnings", []) or [])
+            # if registry fallback used, mark lockfile as registry-fallback when no package-lock was produced
+            if lockfile["type"] == "none":
+                lockfile = {"type": "registry-fallback", "content": None}
+    except Exception as e:
+        # last resort: call resolve_and_pin (existing logic) to preserve behavior
+        warnings.append(f"dependency resolution pipeline exception: {e}")
+        try:
+            fallback = resolve_and_pin(collected, language=language)
+            pinned.update(fallback.get("pinned", {}) or {})
+            warnings.extend(fallback.get("warnings", []) or [])
+            if not lockfile or lockfile["type"] == "none":
+                lockfile = fallback.get("lockfile", {"type": "registry-fallback", "content": None})
+        except Exception:
+            pass
 
     # rewrite package sections with pinned versions
     for sec in ("dependencies", "devDependencies", "peerDependencies"):
@@ -251,3 +283,113 @@ def resolve_and_pin_files(files: List[Dict[str, str]], options: Dict[str, Any]) 
 
     meta = {"pinned": pinned, "warnings": warnings, "lockfile": lockfile}
     return files, meta
+
+
+# constants (tune as needed)
+NPM_INSTALL_TIMEOUT = 120  # seconds
+NPM_CMD = "npm"
+
+def _run_npm_package_lock_only(pkg_json_obj: Dict[str, Any], timeout: int = NPM_INSTALL_TIMEOUT) -> Dict[str, Any]:
+    """
+    Given a package.json object, run `npm install --package-lock-only` in a tempdir
+    and return parsed package-lock.json (or raise/return error info).
+    The command uses --ignore-scripts to avoid running lifecycle scripts.
+    """
+    td = tempfile.mkdtemp(prefix="npm_resolve_")
+    try:
+        pj_path = Path(td) / "package.json"
+        pj_path.write_text(json.dumps(pkg_json_obj), encoding="utf-8")
+
+        # environment to reduce telemetry and avoid running scripts
+        env = os.environ.copy()
+        env["npm_config_audit"] = "false"
+        env["npm_config_fund"] = "false"
+        # ensure scripts are ignored
+        # Note: --ignore-scripts flag passed to npm below is the key safety measure.
+        cmd = [NPM_CMD, "install", "--package-lock-only", "--no-audit", "--no-fund", "--ignore-scripts"]
+
+        proc = subprocess.run(cmd, cwd=td, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        out = proc.stdout or ""
+        lock_path = Path(td) / "package-lock.json"
+        if proc.returncode != 0:
+            # still attempt to read lockfile if produced; otherwise raise informative error
+            if lock_path.exists():
+                try:
+                    lock_json = json.loads(lock_path.read_text(encoding="utf-8"))
+                    return {"ok": True, "lockfile": lock_json, "stdout": out, "warnings": [f"npm exited {proc.returncode}, but lockfile present"]}
+                except Exception as e:
+                    return {"ok": False, "error": f"npm exited {proc.returncode}; failed to read lockfile: {e}", "stdout": out}
+            return {"ok": False, "error": f"npm exited {proc.returncode}", "stdout": out}
+
+        if not lock_path.exists():
+            return {"ok": False, "error": "npm finished but package-lock.json missing", "stdout": out}
+
+        try:
+            lock_json = json.loads(lock_path.read_text(encoding="utf-8"))
+            return {"ok": True, "lockfile": lock_json, "stdout": out}
+        except Exception as e:
+            return {"ok": False, "error": f"failed to parse package-lock.json: {e}", "stdout": out}
+    except subprocess.TimeoutExpired as e:
+        return {"ok": False, "error": f"npm timed out after {timeout}s: {e}", "stdout": getattr(e, "output", "")}
+    finally:
+        try:
+            shutil.rmtree(td, ignore_errors=True)
+        except Exception:
+            pass
+
+def _extract_pinned_from_lockfile(lock_json: Dict[str, Any], requested_names: List[str]) -> Dict[str, str]:
+    """
+    Parse lockfile to obtain pinned versions for requested top-level packages.
+    Handles both npm v1/v2 shapes:
+      - lock_json.get("dependencies", {...})
+      - lock_json.get("packages", {...}) where keys like "node_modules/<pkg>"
+    Returns dict name -> version (only for names present in lockfile)
+    """
+    pinned: Dict[str, str] = {}
+
+    # 1) try "dependencies" top-level (common)
+    deps = lock_json.get("dependencies", {}) or {}
+    for name in requested_names:
+        info = deps.get(name)
+        if isinstance(info, dict):
+            ver = info.get("version")
+            if ver:
+                pinned[name] = ver
+
+    # 2) fallback: "packages" object where keys include node_modules/<name>
+    if len(pinned) < len(requested_names):
+        packages = lock_json.get("packages", {}) or {}
+        for pkg_path, meta in packages.items():
+            # pkg_path may be "" (root) or "node_modules/<name>" or deeper
+            if not pkg_path.startswith("node_modules/"):
+                continue
+            nm = pkg_path.replace("node_modules/", "", 1)
+            if nm in requested_names and isinstance(meta, dict):
+                ver = meta.get("version")
+                if ver:
+                    pinned[nm] = ver
+
+    return pinned
+
+# Example wrapper you can call from resolve_and_pin_files
+def resolve_with_npm_lockfile_fully(pkg_obj: Dict[str, Any], requested_names: List[str], timeout: int = NPM_INSTALL_TIMEOUT) -> Dict[str, Any]:
+    """
+    Given a package.json dict (pkg_obj) and a list of top-level dependency names, attempt to
+    run npm --package-lock-only and extract pinned versions. Returns:
+      {
+        "ok": True/False,
+        "pinned": {name: version, ...},
+        "lockfile": {...} or None,
+        "stdout": "npm output",
+        "error": "optional error message",
+        "warnings": [...]
+      }
+    """
+    res = _run_npm_package_lock_only(pkg_obj, timeout=timeout)
+    if not res.get("ok"):
+        # pass through error info
+        return {"ok": False, "pinned": {}, "lockfile": None, "stdout": res.get("stdout", ""), "error": res.get("error"), "warnings": res.get("warnings", [])}
+
+    lock_json = res.get("lockfile")
+    pinned = _extract_pinned_from_lockfile(lock_json, requested_names)
+    return {"ok": True, "pinned": pinned, "lockfile": lock_json, "stdout": res.get("stdout", ""), "warnings": res.get("warnings", [])}

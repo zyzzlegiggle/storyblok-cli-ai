@@ -74,7 +74,7 @@ def get_llm():
         os.environ["GOOGLE_API_KEY"] = api_key
     # Instantiate the LangChain Google Gemini LLM wrapper
     # you can adjust model name to available ones in your account
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0.5)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.5)
     return llm
 
 def _save_debug_log(prefix: str, payload: Dict[str, Any]):

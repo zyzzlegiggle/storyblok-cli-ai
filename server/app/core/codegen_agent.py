@@ -21,11 +21,13 @@ import traceback
 import pickle
 from pathlib import Path
 from typing import Dict, Any, List, Optional, AsyncGenerator
+import requests
 
 from core.llm_client import call_structured_generation, GenerateResponseModel
 from core.prompts import build_system_prompt, build_user_prompt, summarize_schema
 from core.dep_resolver import resolve_and_pin_files
 from core.validator import run_validations, attempt_repair
+from core.followup_agent import generate_followup_questions  # localized import
 
 # configuration
 CHUNK_SIZE = int(os.environ.get("AI_CHUNK_SIZE", 10))
@@ -37,136 +39,7 @@ STREAM_CHUNK_SZ = int(os.environ.get("AI_STREAM_CHUNK_SZ", 1024))
 NPM_REGISTRY = "https://registry.npmjs.org"
 NPM_CACHE_FILE = os.path.join(LOG_DIR, "npm_cache.pkl")
 NPM_CACHE_TTL = 24 * 3600  # seconds
-DEP_MAP_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "dependency_map.json")
 os.makedirs(LOG_DIR, exist_ok=True)
-
-# load curated map if present
-try:
-    with open(DEP_MAP_PATH, "r", encoding="utf-8") as fh:
-        CURATED_DEP_MAP = json.load(fh)
-except Exception:
-    CURATED_DEP_MAP = {}
-
-# ----------------------------
-# NPM helpers (small cache)
-# ----------------------------
-def _load_npm_cache():
-    try:
-        if os.path.exists(NPM_CACHE_FILE):
-            mtime = os.path.getmtime(NPM_CACHE_FILE)
-            if time.time() - mtime < NPM_CACHE_TTL:
-                with open(NPM_CACHE_FILE, "rb") as fh:
-                    return pickle.load(fh)
-    except Exception:
-        pass
-    return {}
-
-def _save_npm_cache(cache):
-    try:
-        with open(NPM_CACHE_FILE, "wb") as fh:
-            pickle.dump(cache, fh)
-    except Exception:
-        pass
-
-import requests
-def get_latest_npm_version(pkg_name: str) -> Optional[str]:
-    try:
-        cache = _load_npm_cache()
-        key = pkg_name
-        if key in cache:
-            entry = cache[key]
-            if time.time() - entry.get("ts", 0) < NPM_CACHE_TTL:
-                return entry.get("ver")
-        url = f"{NPM_REGISTRY}/{pkg_name}"
-        resp = requests.get(url, timeout=10)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        dist_tags = data.get("dist-tags", {})
-        latest = dist_tags.get("latest")
-        if latest:
-            cache[key] = {"ver": latest, "ts": time.time()}
-            _save_npm_cache(cache)
-            return latest
-        if "version" in data:
-            v = data.get("version")
-            cache[key] = {"ver": v, "ts": time.time()}
-            _save_npm_cache(cache)
-            return v
-        return None
-    except Exception:
-        return None
-
-def _pin_dep_version(name: str, requested: Any) -> (str, str):
-    """
-    Return (name, pinned_version). Prefer curated map entries; otherwise query npm; otherwise fallback.
-    """
-    # prefer curated map (search across stacks)
-    try:
-        for stack, mapping in CURATED_DEP_MAP.items():
-            deps = mapping.get("dependencies", {}) or {}
-            devs = mapping.get("devDependencies", {}) or {}
-            if name in deps:
-                return name, deps[name]
-            if name in devs:
-                return name, devs[name]
-    except Exception:
-        pass
-
-    # query npm
-    latest = get_latest_npm_version(name)
-    if latest:
-        return name, latest
-
-    # fallback: strip ^/~ if requested is str
-    try:
-        if isinstance(requested, str):
-            stripped = requested.lstrip("^~")
-            if stripped:
-                return name, stripped
-    except Exception:
-        pass
-    return name, "1.0.0"
-
-def resolve_and_pin_dependencies(files: List[Dict[str, str]], options: Dict[str, Any]) -> (List[Dict[str, str]], Dict[str, Any]):
-    """
-    Find package.json in files, pin dependency versions using curated map + npm registry.
-    Returns updated files and a metadata dict about dependency resolution.
-    """
-    meta = {"resolved": [], "warnings": [], "lockfile": {"skipped": True, "reason": "npm not available on backend"}}
-    pkg_idx = None
-    pkg_obj = None
-    for i, f in enumerate(files):
-        path = os.path.normpath(f.get("path", ""))
-        if path == "package.json" or path.endswith("/package.json"):
-            try:
-                pkg_obj = json.loads(f.get("content", "") or "{}")
-                pkg_idx = i
-            except Exception as e:
-                meta["warnings"].append(f"failed to parse package.json: {e}")
-                pkg_obj = None
-            break
-
-    if pkg_obj is None:
-        return files, meta
-
-    for sec in ("dependencies", "devDependencies", "peerDependencies"):
-        sec_map = pkg_obj.get(sec, {}) or {}
-        pinned = {}
-        for name, requested in sec_map.items():
-            nm, pv = _pin_dep_version(name, requested)
-            pinned[nm] = pv
-            meta["resolved"].append({"name": nm, "version": pv, "origin": "curated_or_registry"})
-        if pinned:
-            pkg_obj[sec] = pinned
-
-    try:
-        files[pkg_idx]["content"] = json.dumps(pkg_obj, indent=2)
-    except Exception:
-        meta["warnings"].append("failed to re-serialize package.json after pinning")
-
-    meta["lockfile"] = {"skipped": True, "reason": "npm not available on backend (no lockfile generated)"}
-    return files, meta
 
 # ----------------------------
 # Utilities & validation
@@ -175,23 +48,6 @@ def chunk_components(components: List[Dict[str, Any]], chunk_size: int = CHUNK_S
     for i in range(0, len(components), chunk_size):
         yield components[i:i + chunk_size]
 
-def run_tsc_check(project_dir: str) -> Dict[str, Any]:
-    """
-    Best-effort TypeScript check. Uses npx tsc --noEmit or tsc --noEmit if available.
-    """
-    cmd = None
-    try:
-        if shutil.which("npx"):
-            cmd = ["npx", "tsc", "--noEmit"]
-        elif shutil.which("tsc"):
-            cmd = ["tsc", "--noEmit"]
-        else:
-            return {"ok": False, "skipped": True, "output": "tsc not found; skipping TypeScript validation"}
-        proc = subprocess.run(cmd, cwd=project_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
-        ok = proc.returncode == 0
-        return {"ok": ok, "skipped": False, "output": proc.stdout}
-    except Exception as e:
-        return {"ok": False, "skipped": False, "output": f"tsc execution failed: {e}"}
 
 def _ensure_parsed_dict(name: str, parsed) -> Dict[str, Any]:
     """
@@ -271,7 +127,7 @@ async def stream_generate_project(payload: Dict[str, Any]) -> AsyncGenerator[str
     request_questions = bool(options.get("request_questions", False))
     if request_questions:
         # Ideally followup agent handles this; but leave compatibility: call followup agent if available
-        from core.followup_agent import generate_followup_questions  # localized import
+        
         qres = await generate_followup_questions(payload)
         followups = qres.get("followups", []) if isinstance(qres, dict) else []
         if followups:
