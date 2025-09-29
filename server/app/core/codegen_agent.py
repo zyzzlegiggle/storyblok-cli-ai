@@ -209,7 +209,27 @@ async def stream_generate_project(payload: Dict[str, Any]) -> AsyncGenerator[str
             try:
                 pinned_files, dep_meta = resolve_and_pin_files(list(accumulated_files), options)
             except Exception as e:
-                dep_meta = {"warnings": [f"dependency resolution failed: {e}"]}
+                dep_meta = {"warnings": [f"dependency resolution failed: {e}"], "pinned": {}, "resolved": []}
+
+            # Emit resolved dependency details if available (so CLI can show found/missing/candidates)
+            try:
+                resolved_list = dep_meta.get("resolved") if isinstance(dep_meta, dict) else None
+                if isinstance(resolved_list, list):
+                    for d in resolved_list:
+                        # Emit each resolved candidate as a structured dependency event
+                        # Each 'd' is expected to be a dict with keys: name, version, source, url, confidence, candidates?
+                        yield await _yield_event("dependency", d)
+            except Exception:
+                pass
+
+            # emit any warnings from dep step
+            try:
+                if isinstance(dep_meta, dict) and dep_meta.get("warnings"):
+                    for w in dep_meta.get("warnings", []):
+                        yield await _yield_event("warning", w)
+            except Exception:
+                pass
+
 
             # emit resolved deps
             try:

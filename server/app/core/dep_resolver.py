@@ -9,7 +9,12 @@ Responsibilities:
 - Provide helper to update package.json inside a list of generated files.
 
 Returns:
-- pinned results: {"pinned": {"pkg": "1.2.3", ...}, "lockfile": {"type": "...", "content": ...}, "warnings": [...]}
+- pinned results: {
+    "resolved": [ {name, version|null, source, url|null, confidence, candidates? }, ... ],
+    "pinned": {"pkg": "1.2.3", ...},
+    "lockfile": {"type": "...", "content": ...},
+    "warnings": [...]
+  }
 """
 
 import json
@@ -19,7 +24,8 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
+import urllib.parse
 
 import requests
 
@@ -27,6 +33,7 @@ LOG_DIR = os.environ.get("AI_BACKEND_LOG_DIR", "./ai_backend_logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 NPM_REGISTRY = "https://registry.npmjs.org"
+NPM_SEARCH = "https://registry.npmjs.org/-/v1/search"
 NPM_CACHE_FILE = os.path.join(LOG_DIR, "npm_cache.pkl")
 NPM_CACHE_TTL = 24 * 3600
 
@@ -52,8 +59,11 @@ def _save_cache(cache: Dict[str, Any]):
     if not pickle:
         return
     try:
-        with open(NPM_CACHE_FILE, "wb") as fh:
+        # atomic write
+        tmp = NPM_CACHE_FILE + ".tmp"
+        with open(tmp, "wb") as fh:
             pickle.dump(cache, fh)
+        os.replace(tmp, NPM_CACHE_FILE)
     except Exception:
         pass
 
@@ -63,130 +73,205 @@ def _npm_available() -> bool:
 def _resolve_with_npm(deps: Dict[str, str]) -> Dict[str, Any]:
     """
     Use npm in a tempdir to create package-lock.json, then return pinned versions.
+    This function now calls the canonical _run_npm_package_lock_only helper to
+    ensure --ignore-scripts is used consistently.
     """
     warnings: List[str] = []
     pinned: Dict[str, str] = {}
     lockfile_content: Optional[Dict[str, Any]] = None
 
-    td = tempfile.mkdtemp(prefix="dep_resolve_")
+    # build minimal package.json with requested deps
+    pkg = {"name": "ai-resolve-temp", "version": "0.0.0", "private": True, "dependencies": {}}
+    for name, req in deps.items():
+        pkg["dependencies"][name] = req if req else "latest"
+
     try:
-        pkg = {"name": "ai-resolve-temp", "version": "0.0.0", "private": True, "dependencies": {}}
-        for name, req in deps.items():
-            # if req is falsy, use latest alias so npm resolves to latest
-            pkg["dependencies"][name] = req if req else "latest"
-        pj = Path(td) / "package.json"
-        pj.write_text(json.dumps(pkg), encoding="utf-8")
-
-        # run npm install --package-lock-only for deterministic lock generation
-        print("npm path:", shutil.which("npm"))
-        cmd = ["npm", "install", "--package-lock-only", "--no-audit", "--no-fund"]
-        proc = subprocess.run(cmd, cwd=td, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
-        out = proc.stdout or ""
-        if proc.returncode != 0:
-            warnings.append(f"npm install failed: exit {proc.returncode}; output: {out[:2000]}")
-            # still try to read package-lock.json if exists
-        lock_path = Path(td) / "package-lock.json"
-        if lock_path.exists():
-            try:
-                lockfile_content = json.loads(lock_path.read_text(encoding="utf-8"))
-                # package-lock v2: dependencies field
-                deps_obj = lockfile_content.get("dependencies", {}) or {}
-                for name in deps.keys():
-                    meta = deps_obj.get(name) or {}
-                    ver = meta.get("version")
-                    if ver:
-                        pinned[name] = ver
-                # If pinned missing for some names, try to inspect packages object (npm <7)
-                if not pinned:
-                    # fallback: top-level packages?
-                    packages = lockfile_content.get("packages", {})
-                    for pkg_path, meta in packages.items():
-                        # pkg_path like "node_modules/react"
-                        if pkg_path.startswith("node_modules/"):
-                            nm = pkg_path.replace("node_modules/", "")
-                            ver = meta.get("version")
-                            if nm and ver and nm in deps:
-                                pinned[nm] = ver
-            except Exception as e:
-                warnings.append(f"failed to parse package-lock.json: {e}")
+        npm_res = _run_npm_package_lock_only(pkg)
+        if not npm_res.get("ok"):
+            warnings.append(f"npm install failed: {npm_res.get('error') or 'unknown'}")
+            # try to salvage lockfile if present
+            lock_json = npm_res.get("lockfile")
+            if lock_json:
+                lockfile_content = lock_json
+                pinned = _extract_pinned_from_lockfile(lock_json, list(deps.keys()))
         else:
-            warnings.append("npm did not write package-lock.json; cannot extract pinned versions")
-
+            lockfile_content = npm_res.get("lockfile")
+            pinned = _extract_pinned_from_lockfile(lockfile_content, list(deps.keys()))
     except Exception as e:
         warnings.append(f"npm resolution failed: {e}")
-    finally:
-        try:
-            shutil.rmtree(td, ignore_errors=True)
-        except Exception:
-            pass
 
     result = {"pinned": pinned, "lockfile": {"type": "package-lock", "content": lockfile_content}, "warnings": warnings}
     return result
 
+def _search_registry(name: str, size: int = 5) -> List[Dict[str, Any]]:
+    """
+    Use npm search endpoint to return candidate packages for a given query.
+    Returns a list of candidate dicts: {name, version, description, links}.
+    """
+    try:
+        params = {"text": name, "size": size}
+        resp = requests.get(NPM_SEARCH, params=params, timeout=8)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        objects = data.get("objects", []) or []
+        out = []
+        for obj in objects:
+            pkg = obj.get("package", {}) or {}
+            out.append({
+                "name": pkg.get("name"),
+                "version": pkg.get("version"),
+                "description": pkg.get("description"),
+                "links": pkg.get("links", {})
+            })
+        return out
+    except Exception:
+        return []
+
 def _resolve_with_registry(deps: Dict[str, str]) -> Dict[str, Any]:
     """
     Fallback: query npm registry dist-tags.latest for each package.
-    This picks the latest release (best-effort).
+    This picks the latest release (best-effort). Adds candidate search when exact lookup fails.
+    Returns 'pinned' dict and 'resolved' list with candidate suggestions for missing packages.
     """
     cache = _load_cache()
     pinned: Dict[str, str] = {}
     warnings: List[str] = []
+    resolved_list: List[Dict[str, Any]] = []
 
     for name in deps.keys():
         try:
+            # Check cache first
             if name in cache:
                 entry = cache[name]
                 if time.time() - entry.get("ts", 0) < NPM_CACHE_TTL:
-                    pinned[name] = entry.get("ver")
+                    ver = entry.get("ver")
+                    pinned[name] = ver
+                    resolved_list.append({
+                        "name": name,
+                        "version": ver,
+                        "source": "npm-cache",
+                        "url": f"{NPM_REGISTRY}/{urllib.parse.quote(name, safe='')}",
+                        "confidence": 0.95
+                    })
                     continue
-            url = f"{NPM_REGISTRY}/{name}"
+
+            # exact name lookup: URL-encode the package name (handles @scope/pkg)
+            encoded = urllib.parse.quote(name, safe='')
+            url = f"{NPM_REGISTRY}/{encoded}"
             resp = requests.get(url, timeout=10)
-            if resp.status_code != 200:
+            if resp.status_code == 200:
+                data = resp.json()
+                ver = None
+                dist = data.get("dist-tags", {}) or {}
+                ver = dist.get("latest") or data.get("version")
+                if not ver:
+                    versions = sorted(list(data.get("versions", {}).keys()))
+                    if versions:
+                        ver = versions[-1]
+                if ver:
+                    pinned[name] = ver
+                    resolved_list.append({
+                        "name": name,
+                        "version": ver,
+                        "source": "npm",
+                        "url": f"{NPM_REGISTRY}/{encoded}",
+                        "confidence": 0.98
+                    })
+                    cache[name] = {"ver": ver, "ts": time.time()}
+                else:
+                    # add unresolved but with candidates
+                    candidates = _search_registry(name)
+                    resolved_list.append({
+                        "name": name,
+                        "version": None,
+                        "source": None,
+                        "url": None,
+                        "confidence": 0.0,
+                        "candidates": candidates
+                    })
+                    warnings.append(f"no version found for {name} in registry response")
+            elif resp.status_code == 404:
+                # package not found - attempt search fallback
+                candidates = _search_registry(name)
+                if candidates:
+                    # choose top candidate as tentative but low confidence
+                    top = candidates[0]
+                    top_name = top.get("name")
+                    top_ver = top.get("version")
+                    pinned[top_name] = top_ver
+                    cache[top_name] = {"ver": top_ver, "ts": time.time()}
+                    resolved_list.append({
+                        "name": name,
+                        "version": None,
+                        "source": None,
+                        "url": None,
+                        "confidence": 0.0,
+                        "candidates": candidates
+                    })
+                    warnings.append(f"{name} not found; suggested candidates returned")
+                else:
+                    resolved_list.append({
+                        "name": name,
+                        "version": None,
+                        "source": None,
+                        "url": None,
+                        "confidence": 0.0,
+                        "candidates": []
+                    })
+                    warnings.append(f"npm registry returned 404 for {name}")
+            else:
                 warnings.append(f"npm registry returned {resp.status_code} for {name}")
-                continue
-            data = resp.json()
-            ver = None
-            dist = data.get("dist-tags", {})
-            ver = dist.get("latest") or data.get("version")
-            if not ver:
-                # pick highest semver available (best-effort)
-                versions = sorted(list(data.get("versions", {}).keys()))
-                if versions:
-                    ver = versions[-1]
-            if ver:
-                pinned[name] = ver
-                cache[name] = {"ver": ver, "ts": time.time()}
         except Exception as e:
             warnings.append(f"failed to query registry for {name}: {e}")
+            resolved_list.append({
+                "name": name,
+                "version": None,
+                "source": None,
+                "url": None,
+                "confidence": 0.0,
+                "candidates": []
+            })
 
     _save_cache(cache)
-    return {"pinned": pinned, "lockfile": {"type": "registry-fallback", "content": None}, "warnings": warnings}
+    return {"pinned": pinned, "resolved": resolved_list, "lockfile": {"type": "registry-fallback", "content": None}, "warnings": warnings}
 
 def resolve_and_pin(deps: Dict[str, str], language: str = "js") -> Dict[str, Any]:
     """
     Public function: given a mapping of dependency name -> requested (range or '').
     Returns:
       {
+        "resolved": [ {name, version|null, source, url|null, confidence, candidates?}, ... ],
         "pinned": { "react": "18.2.0", ... },
         "lockfile": {"type": "package-lock"|"registry-fallback", "content": {...} or None},
         "warnings": [...]
       }
     """
     if not deps:
-        return {"pinned": {}, "lockfile": {"type": "none", "content": None}, "warnings": []}
+        return {"resolved": [], "pinned": {}, "lockfile": {"type": "none", "content": None}, "warnings": []}
 
-    # Prefer npm resolution for JS/TS projects if npm exists
     if language in ("js", "ts", "node", "tsx") and _npm_available():
         res = _resolve_with_npm(deps)
-        # if npm failed to produce pins for many packages, fallback to registry for missing entries
-        missing = [n for n in deps.keys() if n not in res.get("pinned", {})]
+        # ensure we have 'resolved' entries for each requested package
+        pinned = res.get("pinned", {}) or {}
+        missing = [n for n in deps.keys() if n not in pinned]
+        resolved_combined: List[Dict[str, Any]] = []
+        # add pinned entries with high confidence
+        for n, v in pinned.items():
+            resolved_combined.append({"name": n, "version": v, "source": "npm", "url": f"{NPM_REGISTRY}/{urllib.parse.quote(n, safe='')}", "confidence": 0.98})
         if missing:
             fallback = _resolve_with_registry({n: deps.get(n) for n in missing})
-            res["pinned"].update(fallback.get("pinned", {}))
-            res["warnings"].extend(fallback.get("warnings", []))
+            pinned.update(fallback.get("pinned", {}) or {})
+            # append fallback resolved entries
+            for entry in fallback.get("resolved", []) or []:
+                resolved_combined.append(entry)
+            res["pinned"] = pinned
+            res["resolved"] = resolved_combined
+            res["warnings"].extend(fallback.get("warnings", []) or [])
+        else:
+            res["resolved"] = resolved_combined
         return res
     else:
-        # Non-JS projects or npm unavailable: use registry lookup
         res = _resolve_with_registry(deps)
         return res
 
@@ -197,7 +282,7 @@ def resolve_and_pin_files(files: List[Dict[str, str]], options: Dict[str, Any]) 
     """
     Given files (list of {path, content}), find package.json and pin its dependencies using resolve_and_pin.
     Returns (updated_files_list, meta)
-    meta contains 'pinned' list and warnings and lockfile info.
+    meta contains 'pinned' list and warnings and lockfile info, and now also 'resolved'.
     """
     pkg_idx = None
     pkg_obj = None
@@ -211,52 +296,49 @@ def resolve_and_pin_files(files: List[Dict[str, str]], options: Dict[str, Any]) 
                 return files, {"warnings": [f"failed to parse package.json: {e}"]}
 
     if pkg_obj is None:
-        return files, {"warnings": [], "pinned": {}, "lockfile": {"type": "none", "content": None}}
+        return files, {"warnings": [], "pinned": {}, "resolved": [], "lockfile": {"type": "none", "content": None}}
 
     # collect deps across sections
     collected = {}
     for sec in ("dependencies", "devDependencies", "peerDependencies"):
         sec_map = pkg_obj.get(sec, {}) or {}
         for name, req in sec_map.items():
-            collected[name] = req if isinstance(req, str) else ""
+            # normalize: if user accidentally added version spec in name, split on @ (naively)
+            if isinstance(name, str) and "@" in name and name.startswith("@") is False and not name.startswith("http"):
+                # avoid splitting scoped names like @scope/pkg
+                # only split if pattern looks like "name@version"
+                parts = name.split("@")
+                if len(parts) == 2 and parts[1] and parts[0]:
+                    nm = parts[0]
+                    collected[nm] = req if isinstance(req, str) else ""
+                else:
+                    collected[name] = req if isinstance(req, str) else ""
+            else:
+                collected[name] = req if isinstance(req, str) else ""
 
     language = "js"
     if options and isinstance(options, dict) and options.get("language"):
         language = options.get("language")
 
-        # Prefer npm lockfile resolution when possible (deterministic)
     pinned = {}
     warnings = []
     lockfile = {"type": "none", "content": None}
+    resolved_entries: List[Dict[str, Any]] = []
 
     try:
-        if language in ("js", "ts", "node", "tsx") and _npm_available():
-            # Attempt to run `npm install --package-lock-only` using the full package.json
-            npm_res = resolve_with_npm_lockfile_fully(pkg_obj, list(collected.keys()))
-            if npm_res.get("ok"):
-                pinned = npm_res.get("pinned", {}) or {}
-                lockfile = {"type": "package-lock", "content": npm_res.get("lockfile")}
-                warnings.extend(npm_res.get("warnings", []) or [])
-            else:
-                # record npm error, will fallback to registry for all packages
-                warnings.append(f"npm lockfile resolution failed: {npm_res.get('error', 'unknown')}")
-        # For any missing packages (or if npm not available), use registry fallback (semver-aware if implemented)
-        missing = [n for n in collected.keys() if n not in pinned]
-        if missing:
-            reg_res = _resolve_with_registry({n: collected.get(n) for n in missing})
-            pinned.update(reg_res.get("pinned", {}) or {})
-            warnings.extend(reg_res.get("warnings", []) or [])
-            # if registry fallback used, mark lockfile as registry-fallback when no package-lock was produced
-            if lockfile["type"] == "none":
-                lockfile = {"type": "registry-fallback", "content": None}
+        res = resolve_and_pin(collected, language=language)
+        pinned = res.get("pinned", {}) or {}
+        lockfile = res.get("lockfile", {"type": "registry-fallback", "content": None}) or {"type": "registry-fallback", "content": None}
+        resolved_entries = res.get("resolved", []) or []
+        warnings.extend(res.get("warnings", []) or [])
     except Exception as e:
-        # last resort: call resolve_and_pin (existing logic) to preserve behavior
         warnings.append(f"dependency resolution pipeline exception: {e}")
         try:
-            fallback = resolve_and_pin(collected, language=language)
+            fallback = _resolve_with_registry(collected)
             pinned.update(fallback.get("pinned", {}) or {})
+            resolved_entries.extend(fallback.get("resolved", []) or [])
             warnings.extend(fallback.get("warnings", []) or [])
-            if not lockfile or lockfile["type"] == "none":
+            if lockfile["type"] == "none":
                 lockfile = fallback.get("lockfile", {"type": "registry-fallback", "content": None})
         except Exception:
             pass
@@ -270,7 +352,7 @@ def resolve_and_pin_files(files: List[Dict[str, str]], options: Dict[str, Any]) 
                 if name in pinned:
                     new_sec[name] = pinned[name]
                 else:
-                    # if pin missing, preserve original request string or fallback to '*'
+                    # preserve original request string or fallback to '*'
                     val = sec_map.get(name)
                     new_sec[name] = val if isinstance(val, str) and val.strip() else "*"
             pkg_obj[sec] = new_sec
@@ -281,7 +363,7 @@ def resolve_and_pin_files(files: List[Dict[str, str]], options: Dict[str, Any]) 
     except Exception as e:
         warnings.append(f"failed to serialize updated package.json: {e}")
 
-    meta = {"pinned": pinned, "warnings": warnings, "lockfile": lockfile}
+    meta = {"pinned": pinned, "resolved": resolved_entries, "warnings": warnings, "lockfile": lockfile}
     return files, meta
 
 
@@ -293,26 +375,22 @@ def _run_npm_package_lock_only(pkg_json_obj: Dict[str, Any], timeout: int = NPM_
     """
     Given a package.json object, run `npm install --package-lock-only` in a tempdir
     and return parsed package-lock.json (or raise/return error info).
-    The command uses --ignore-scripts to avoid running lifecycle scripts.
+    Uses --ignore-scripts for safety.
     """
     td = tempfile.mkdtemp(prefix="npm_resolve_")
     try:
         pj_path = Path(td) / "package.json"
         pj_path.write_text(json.dumps(pkg_json_obj), encoding="utf-8")
 
-        # environment to reduce telemetry and avoid running scripts
         env = os.environ.copy()
         env["npm_config_audit"] = "false"
         env["npm_config_fund"] = "false"
-        # ensure scripts are ignored
-        # Note: --ignore-scripts flag passed to npm below is the key safety measure.
         cmd = [NPM_CMD, "install", "--package-lock-only", "--no-audit", "--no-fund", "--ignore-scripts"]
 
         proc = subprocess.run(cmd, cwd=td, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
         out = proc.stdout or ""
         lock_path = Path(td) / "package-lock.json"
         if proc.returncode != 0:
-            # still attempt to read lockfile if produced; otherwise raise informative error
             if lock_path.exists():
                 try:
                     lock_json = json.loads(lock_path.read_text(encoding="utf-8"))
@@ -360,7 +438,8 @@ def _extract_pinned_from_lockfile(lock_json: Dict[str, Any], requested_names: Li
     if len(pinned) < len(requested_names):
         packages = lock_json.get("packages", {}) or {}
         for pkg_path, meta in packages.items():
-            # pkg_path may be "" (root) or "node_modules/<name>" or deeper
+            if not isinstance(pkg_path, str):
+                continue
             if not pkg_path.startswith("node_modules/"):
                 continue
             nm = pkg_path.replace("node_modules/", "", 1)
@@ -371,7 +450,6 @@ def _extract_pinned_from_lockfile(lock_json: Dict[str, Any], requested_names: Li
 
     return pinned
 
-# Example wrapper you can call from resolve_and_pin_files
 def resolve_with_npm_lockfile_fully(pkg_obj: Dict[str, Any], requested_names: List[str], timeout: int = NPM_INSTALL_TIMEOUT) -> Dict[str, Any]:
     """
     Given a package.json dict (pkg_obj) and a list of top-level dependency names, attempt to
@@ -387,7 +465,6 @@ def resolve_with_npm_lockfile_fully(pkg_obj: Dict[str, Any], requested_names: Li
     """
     res = _run_npm_package_lock_only(pkg_obj, timeout=timeout)
     if not res.get("ok"):
-        # pass through error info
         return {"ok": False, "pinned": {}, "lockfile": None, "stdout": res.get("stdout", ""), "error": res.get("error"), "warnings": res.get("warnings", [])}
 
     lock_json = res.get("lockfile")

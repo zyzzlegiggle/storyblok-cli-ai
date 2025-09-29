@@ -531,6 +531,23 @@ func runCreateWizard(cmd *cobra.Command) error {
 					f.Close()
 				}
 				_ = final // nothing now
+			case "dependency":
+				if m, ok := payloadEv.(map[string]interface{}); ok {
+					name, _ := m["name"].(string)
+					version, _ := m["version"].(string)
+					conf, _ := m["confidence"].(float64)
+					if version != "" {
+						fmt.Printf("Resolved: %s@%s (confidence %.2f)\n", name, version, conf)
+					} else {
+						// print candidate summary if available
+						if cands, ok := m["candidates"].([]interface{}); ok && len(cands) > 0 {
+							fmt.Printf("Dependency not found: %s — suggested: %v\n", name, cands)
+						} else {
+							fmt.Printf("Dependency not found: %s\n", name)
+						}
+					}
+				}
+
 			case "file_complete":
 				m, _ := payloadEv.(map[string]interface{})
 				path, _ := m["path"].(string)
