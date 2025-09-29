@@ -283,46 +283,81 @@ func runCreateWizard(cmd *cobra.Command) error {
 	backendURL := "http://127.0.0.1:8000/generate/"
 
 	// --- New: ask backend to generate structured requirements questions (guarantee at least one) ---
-	questionPayload := map[string]interface{}{
-		"user_answers":     payload["user_answers"],
-		"storyblok_schema": payload["storyblok_schema"],
-		"options": map[string]interface{}{
-			"request_questions": true,
-			"max_questions":     5,
-			"debug":             payload["options"].(map[string]interface{})["debug"],
-		},
-	}
+	// --- Iterative question-generation rounds (replaces the single-question block) ---
+	maxFollowupRounds := 2 // number of rounds (you asked for 2 rounds of 5 questions each)
+	roundQuestions := 5    // questions per round
 
-	qResp, err := callBackend(backendURL+"questions", questionPayload)
-	if err != nil {
-		// non-fatal: continue to main loop (backend may not be available)
-		fmt.Fprintf(os.Stderr, "warning: question-generation failed: %v\n", err)
-	} else {
-		// extract top-level followups if any
-		var initialFollowups []map[string]interface{}
+	for round := 1; round <= maxFollowupRounds; round++ {
+		// build payload for question generation; include current followup_answers so LLM can build on them
+		qPayload := map[string]interface{}{
+			"user_answers":     payload["user_answers"],
+			"storyblok_schema": payload["storyblok_schema"],
+			"options": map[string]interface{}{
+				"request_questions": true,
+				"max_questions":     roundQuestions,
+				"round_number":      round,
+				"debug":             payload["options"].(map[string]interface{})["debug"],
+			},
+		}
+
+		qResp, err := callBackend(backendURL+"questions", qPayload)
+		if err != nil {
+			// non-fatal: on first round, fall back to a single generic prompt; else continue
+			fmt.Fprintf(os.Stderr, "warning: question-generation failed (round %d): %v\n", round, err)
+			if round == 1 {
+				fallback := []map[string]interface{}{
+					{"id": "", "question": "Briefly describe the key requirements (pages, main features, visual style):", "type": "text", "default": ""},
+				}
+				ansMap, err := promptFollowupsAndCollect(fallback)
+				if err != nil {
+					return fmt.Errorf("aborted while answering initial requirements: %w", err)
+				}
+				// attach answers and continue to next round (or finish if maxFollowupRounds==1)
+				userAns, _ := payload["user_answers"].(map[string]interface{})
+				if userAns == nil {
+					userAns = map[string]interface{}{}
+				}
+				existing := map[string]interface{}{}
+				if fa, ok := userAns["followup_answers"].(map[string]interface{}); ok {
+					existing = fa
+				}
+				for k, v := range ansMap {
+					existing[k] = v
+				}
+				userAns["followup_answers"] = existing
+				payload["user_answers"] = userAns
+				continue
+			}
+			// if backend failed mid-rounds, break out and continue flow
+			break
+		}
+
+		// extract followups
+		currentFollowups := []map[string]interface{}{}
 		if fRaw, ok := qResp["followups"]; ok {
 			if arr, ok := fRaw.([]interface{}); ok {
 				for _, it := range arr {
-					if s, ok := it.(string); ok && strings.TrimSpace(s) != "" {
-						initialFollowups = append(initialFollowups, map[string]interface{}{"id": "", "question": s, "type": "text", "default": ""})
+					if m, ok := it.(map[string]interface{}); ok {
+						currentFollowups = append(currentFollowups, m)
+					} else if s, ok := it.(string); ok && strings.TrimSpace(s) != "" {
+						currentFollowups = append(currentFollowups, map[string]interface{}{"id": "", "question": s, "type": "text", "default": ""})
 					}
 				}
 			}
 		}
-		// Short generic prompt fallback (if backend returned zero followups)
-		if len(initialFollowups) == 0 {
-			initialFollowups = []map[string]interface{}{
-				{"id": "", "question": "Briefly describe the key requirements (pages, main features, visual style):", "type": "text", "default": ""},
-			}
+
+		// if no new followups, stop early
+		if len(currentFollowups) == 0 {
+			break
 		}
 
-		// prompt the user for these generated questions (auto-fill from cache)
-		ansMap, err := promptFollowupsAndCollect(initialFollowups)
+		// prompt the user for this round's followups
+		ansMap, err := promptFollowupsAndCollect(currentFollowups)
 		if err != nil {
-			return fmt.Errorf("aborted while answering initial requirements: %w", err)
+			return fmt.Errorf("aborted while answering followups (round %d): %w", round, err)
 		}
 
-		// attach these initial answers to payload.user_answers.followup_answers
+		// merge answers into payload.user_answers.followup_answers
 		userAns, _ := payload["user_answers"].(map[string]interface{})
 		if userAns == nil {
 			userAns = map[string]interface{}{}
@@ -336,8 +371,10 @@ func runCreateWizard(cmd *cobra.Command) error {
 		}
 		userAns["followup_answers"] = existing
 		payload["user_answers"] = userAns
+
+		// loop to next round (backend will see updated followup_answers)
 	}
-	// --- end question-generation step ---
+	// --- end iterative followup rounds ---
 
 	// 5) followup loop
 	maxRounds := 20

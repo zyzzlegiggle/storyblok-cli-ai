@@ -103,7 +103,7 @@ def build_system_prompt(model_name: Optional[str] = None) -> str:
     Clear, short rules to reduce accidental extra text.
     """
     return (
-        "You are an expert code generator producing React frontends wired to Storyblok with Tailwind styling.\n"
+        "You are an expert and creative code generator producing NextJS React frontends wired to Storyblok with Tailwind styling.\n"
         "OUTPUT RULES:\n"
         " - Return EXACTLY one valid JSON object and nothing else.\n"
         " - Top-level keys must include: project_name, files, dependencies, metadata, warnings, followups.\n"
@@ -140,6 +140,8 @@ def build_question_generation_prompt(user_answers: Dict[str, Any],
     """
     Build the followup-generation body (context + short task).
     This is appended to the followup system prompt.
+    Now supports iterative rounds by reading options['round_number'] and
+    options['prev_followup_answers'] (same structure as user_answers['followup_answers']).
     """
     schema_summary = summarize_schema(schema)
     try:
@@ -148,18 +150,30 @@ def build_question_generation_prompt(user_answers: Dict[str, Any],
         user_json = str(user_answers)
     opt_json = json.dumps(options or {}, indent=2)
 
+    round_num = (options.get("round_number") if options and isinstance(options, dict) else None) or 1
+    prev_fanswers = {}
+    if isinstance(user_answers, dict):
+        prev_fanswers = user_answers.get("followup_answers", {}) or {}
+
+    try:
+        prev_json = json.dumps(prev_fanswers, indent=2)
+    except Exception:
+        prev_json = str(prev_fanswers)
+
     prompt = (
         "Context:\n"
         f"User description / answers:\n{user_json}\n\n"
         f"Storyblok schema summary:\n{schema_summary}\n\n"
+        f"Previous followup answers (round {round_num}):\n{prev_json}\n\n"
         f"Options:\n{opt_json}\n\n"
         "Task:\n"
-        " - Based on the context above, decide what clarifying questions are required to produce a runnable frontend scaffold.\n"
-        " - If required, return questions in the 'followups' array (caller will request the number of questions).\n\n"
+        " - Based on the context above and the previous answers, produce follow-up questions that *add new, necessary detail*.\n"
+        " - Avoid repeating or re-asking questions already answered in 'Previous followup answers'.\n"
+        " - Prioritize missing-critical information required to produce a runnable scaffold (pages, content mapping, auth, routing, i18n, deployment target, styling tokens).\n"
+        " - If no additional clarifying questions are required, return an empty 'followups' array.\n\n"
         "Remember: output must be a single JSON object with key 'followups' (array of question strings)."
     )
     return prompt
-
 
 def build_user_prompt(user_answers: Dict[str, Any], schema: Dict[str, Any], options: Dict[str, Any]) -> str:
     """
