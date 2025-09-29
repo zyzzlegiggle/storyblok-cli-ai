@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from core.prompts import build_question_generation_prompt, build_followup_system_prompt
 from core.llm_client import call_structured_generation, FollowupsListModel
+from app.utils.config import AGENT_TEMPERATURES
 
 # Small, forgiving parser for structured LLM outputs
 def _parse_followups(raw) -> List[str]:
@@ -72,7 +73,7 @@ async def generate_followup_questions(payload: Dict[str, Any]) -> Dict[str, Any]
 
     parsed = None
     try:
-        parsed = await call_structured_generation(full_prompt, FollowupsListModel, max_retries=1, timeout=30, debug=debug)
+        parsed = await call_structured_generation(full_prompt, FollowupsListModel, max_retries=1, timeout=30, debug=debug, temperature=AGENT_TEMPERATURES["followup"])
     except Exception:
         parsed = None
 

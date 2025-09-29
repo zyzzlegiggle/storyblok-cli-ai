@@ -65,7 +65,7 @@ class FollowupsListModel(BaseModel):
 # -------------------------
 # LLM init + structured call
 # -------------------------
-def get_llm():
+def get_llm(temperature: float = 0.0):
     # use the env var you specified
     api_key = os.getenv("GOOGLE_API_KEY_GEMINI")
     if not api_key:
@@ -74,7 +74,7 @@ def get_llm():
         os.environ["GOOGLE_API_KEY"] = api_key
     # Instantiate the LangChain Google Gemini LLM wrapper
     # you can adjust model name to available ones in your account
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=temperature)
     return llm
 
 def _save_debug_log(prefix: str, payload: Dict[str, Any]):
@@ -90,13 +90,15 @@ async def call_structured_generation(prompt: str,
                                      structured_model: BaseModel,
                                      max_retries: int = 2,
                                      timeout: int = 180,
-                                     debug: bool = False) -> Dict[str, Any]:
+                                     debug: bool = False,
+                                     temperature: float = 0.0
+                                     ) -> Dict[str, Any]:
     """
     Call Gemini via langchain_google_genai ChatGoogleGenerativeAI.with_structured_output.
     structured_model should be a Pydantic model class (like GenerateResponseModel).
     Returns a dict parsed from the model response.
     """
-    llm = get_llm()
+    llm = get_llm(temperature)
 
     # Build structured callable: pass the Pydantic class itself
     structured_callable = llm.with_structured_output(structured_model, method="json_mode")

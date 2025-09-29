@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 
 from core.llm_client import call_structured_generation, GenerateResponseModel
-from core.prompts import build_system_prompt
+from app.utils.config import AGENT_TEMPERATURES
 
 # Configuration (can be tuned via env)
 LLM_RETRIES = int(os.environ.get("AI_RETRY_COUNT", 2))
@@ -200,7 +200,7 @@ async def attempt_repair(workdir: str, failing_output: str, files: List[Dict[str
         prompt = _build_repair_prompt(user_answers, failing_output, files, options)
         try:
             # Use GenerateResponseModel because it matches files:list[{path,content}]
-            parsed = await call_structured_generation(prompt, GenerateResponseModel, max_retries=1, timeout=REPAIR_TIMEOUT, debug=debug)
+            parsed = await call_structured_generation(prompt, GenerateResponseModel, max_retries=1, timeout=REPAIR_TIMEOUT, debug=debug,temperature=AGENT_TEMPERATURES["validator"])
             parsed = parsed or {}
         except Exception as e:
             # LLM call failed; record and break

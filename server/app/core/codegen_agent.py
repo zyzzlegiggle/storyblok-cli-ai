@@ -28,6 +28,7 @@ from core.prompts import build_system_prompt, build_user_prompt, summarize_schem
 from core.dep_resolver import resolve_and_pin_files
 from core.validator import run_validations, attempt_repair
 from core.followup_agent import generate_followup_questions  # localized import
+from app.utils.config import AGENT_TEMPERATURES
 
 # configuration
 CHUNK_SIZE = int(os.environ.get("AI_CHUNK_SIZE", 10))
@@ -162,7 +163,7 @@ async def stream_generate_project(payload: Dict[str, Any]) -> AsyncGenerator[str
 
     if not components:
         full_prompt = system_prompt + "\n" + user_prompt + "\n\nReturn JSON with project_name, files[], metadata."
-        parsed = await call_structured_generation(full_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
+        parsed = await call_structured_generation(full_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug, temperature=AGENT_TEMPERATURES["codegen"])
         parsed = _ensure_parsed_dict("full_gen", parsed)
         files = parsed.get("files", []) or []
         async for ev in _stream_files_list(files):
