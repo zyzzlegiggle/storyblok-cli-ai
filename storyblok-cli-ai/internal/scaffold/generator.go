@@ -17,9 +17,8 @@ import (
 
 // GenerateRequest and response shapes (match the backend)
 type GenerateRequest struct {
-	UserAnswers     map[string]interface{} `json:"user_answers"`
-	StoryblokSchema map[string]interface{} `json:"storyblok_schema"`
-	Options         map[string]interface{} `json:"options,omitempty"`
+	UserAnswers map[string]interface{} `json:"user_answers"`
+	Options     map[string]interface{} `json:"options,omitempty"`
 }
 
 type FileOut struct {
@@ -222,7 +221,6 @@ func copyFile(src, dst string) error {
 	}
 	return nil
 }
-
 
 func WriteFilesAtomically(files []FileOut, projectDir string) error {
 	absTarget, err := filepath.Abs(projectDir)

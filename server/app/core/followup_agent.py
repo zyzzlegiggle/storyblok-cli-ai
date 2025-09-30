@@ -57,7 +57,7 @@ def _parse_followups(raw) -> List[Dict[str, Any]]:
 async def generate_followup_questions(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Dedicated followup-question generator.
-    Input payload: { user_answers, storyblok_schema, options }
+    Input payload: { user_answers, options }
     Behavior:
       - options may include:
           - max_questions (int)
@@ -68,7 +68,6 @@ async def generate_followup_questions(payload: Dict[str, Any]) -> Dict[str, Any]
     Returns: {"followups": [ {id, question, urgency}, ... ] }
     """
     user_answers = payload.get("user_answers", {}) or {}
-    schema = payload.get("storyblok_schema", {}) or {}
     options = payload.get("options", {}) or {}
     debug = bool(options.get("debug", False))
 
@@ -84,7 +83,7 @@ async def generate_followup_questions(payload: Dict[str, Any]) -> Dict[str, Any]
 
     # Build followup-focused prompt
     system_prompt = build_followup_system_prompt(max_questions=max_questions)
-    body_prompt = build_question_generation_prompt(user_answers, schema, options)
+    body_prompt = build_question_generation_prompt(user_answers, options)
     full_prompt = system_prompt + "\n\n" + body_prompt
 
     # Local normalizer

@@ -3,7 +3,6 @@ from typing import Any, Dict, List, Optional
 
 class GenerateRequest(BaseModel):
     user_answers: Dict[str, Any]
-    storyblok_schema: Dict[str, Any]
     options: Optional[Dict[str, Any]] = {}
 
 class FileOut(BaseModel):

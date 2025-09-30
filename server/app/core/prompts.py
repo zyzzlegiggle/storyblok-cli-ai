@@ -6,95 +6,11 @@ Goals:
 - Force JSON-only structured outputs the backend can parse.
 - Provide a clear dependency policy: return dependency *names only* (no versions).
 - Provide a structured followup-question format so the CLI can render them and prefill answers.
-- Encourage concise schema summaries and conservative file output (returns partial files + warnings).
 """
 
 import json
 from typing import Any, Dict, List, Optional
 
-
-def summarize_schema(schema: Dict[str, Any],
-                     max_components: int = 12,
-                     max_fields: int = 8,
-                     max_chars: int = 1500) -> str:
-    """
-    Produce a concise textual summary of a Storyblok schema object.
-    - schema: raw JSON from Storyblok (expected key 'components' or similar)
-    - returned string is human-friendly and intended for LLM prompts
-    """
-    if not schema:
-        return "(no schema provided)"
-
-    lines: List[str] = []
-    components = []
-
-    # Common Storyblok export uses "components" as top-level
-    if isinstance(schema, dict) and "components" in schema:
-        components = schema.get("components") or []
-    else:
-        # Heuristic: find any list of dicts that looks like components
-        for k, v in schema.items():
-            if isinstance(v, list) and v and isinstance(v[0], dict) and "name" in v[0]:
-                components = v
-                break
-        if not components:
-            # Last resort: if schema is a mapping of component-name -> schema
-            comps = []
-            for k, v in schema.items():
-                if isinstance(v, dict):
-                    comps.append({"name": k, "schema": v})
-            components = comps
-
-    if not isinstance(components, list) or not components:
-        return "(schema provided but no recognizable components found)"
-
-    n = 0
-    total = len(components)
-    for comp in components:
-        if n >= max_components:
-            lines.append(f"...and {total - max_components} more components (truncated)")
-            break
-        n += 1
-
-        name = comp.get("name") or comp.get("display_name") or comp.get("component") or "Component"
-        lines.append(f"- Component: {name}")
-
-        comp_schema = comp.get("schema") or comp.get("fields") or {}
-        if isinstance(comp_schema, dict):
-            fields = list(comp_schema.keys())
-        elif isinstance(comp_schema, list):
-            try:
-                fields = [f.get("name", f.get("field", "unnamed")) for f in comp_schema]
-            except Exception:
-                fields = []
-        else:
-            fields = []
-
-        if not fields:
-            lines.append("    fields: (none detected)")
-        else:
-            shown = 0
-            field_strs = []
-            for field in fields:
-                if shown >= max_fields:
-                    break
-                ftype = None
-                if isinstance(comp_schema, dict) and field in comp_schema and isinstance(comp_schema[field], dict):
-                    ftype = comp_schema[field].get("type") or comp_schema[field].get("field_type")
-                if ftype:
-                    field_strs.append(f"{field}:{ftype}")
-                else:
-                    field_strs.append(str(field))
-                shown += 1
-            if len(fields) > max_fields:
-                field_strs.append(f"...(+{len(fields)-max_fields} more)")
-            lines.append("    fields: " + ", ".join(field_strs))
-
-        if sum(len(l) for l in lines) > max_chars:
-            lines.append("...schema summary truncated due to length")
-            break
-
-    return "\n".join(lines)
 
 
 def build_system_prompt(model_name: Optional[str] = None) -> str:
@@ -135,14 +51,12 @@ def build_followup_system_prompt(max_questions: int = 5, model_name: Optional[st
 
 
 def build_question_generation_prompt(user_answers: Dict[str, Any],
-                                     schema: Dict[str, Any],
                                      options: Dict[str, Any]) -> str:
     """
     Build the followup-generation prompt. Now explicitly includes previous followups
     and their answers (id->question->answer), and instructs the model to base next
     questions on those answers and NOT to repeat the same questions.
     """
-    schema_summary = summarize_schema(schema)
     try:
         user_json = json.dumps(user_answers, indent=2)
     except Exception:
@@ -166,7 +80,6 @@ def build_question_generation_prompt(user_answers: Dict[str, Any],
         "Context:",
         f"User description / answers:\n{user_json}",
         "",
-        f"Storyblok schema summary:\n{schema_summary}",
         "",
         f"Previous followup answers (round {round_num}):\n{prev_json}",
         "",
@@ -189,11 +102,10 @@ def build_question_generation_prompt(user_answers: Dict[str, Any],
     return "\n".join(prompt_lines)
 
 
-def build_user_prompt(user_answers: Dict[str, Any], schema: Dict[str, Any], options: Dict[str, Any]) -> str:
+def build_user_prompt(user_answers: Dict[str, Any],  options: Dict[str, Any]) -> str:
     """
     Prompt body for the main generation step. Combined with build_system_prompt above.
     """
-    schema_summary = summarize_schema(schema)
     try:
         user_json = json.dumps(user_answers, indent=2)
     except Exception:
@@ -203,14 +115,12 @@ def build_user_prompt(user_answers: Dict[str, Any], schema: Dict[str, Any], opti
     prompt = (
         "Context:\n"
         f"User requirements:\n{user_json}\n\n"
-        f"Storyblok schema summary:\n{schema_summary}\n\n"
         f"Options:\n{opt_json}\n\n"
         "Generation instructions:\n"
         " 1) Produce a runnable frontend scaffold matching the user's requirements.\n"
-        " 2) Include minimal scaffolding files: package.json, build config, basic pages, Storyblok client, and representative components.\n"
-        " 3) Only list dependency NAMES in 'dependencies' (no versions).\n"
-        " 4) If any required information is missing, set 'followups' to a non-empty array (strings) and leave 'files' empty.\n"
-        " 5) If you cannot generate everything, return partial files and include a clear note in metadata.warnings.\n\n"
+        " 2) Only list dependency NAMES in 'dependencies' (no versions).\n"
+        " 3) If any required information is missing, set 'followups' to a non-empty array (strings) and leave 'files' empty.\n"
+        " 4) If you cannot generate everything, return partial files and include a clear note in metadata.warnings.\n\n"
         "Output: produce the single JSON object described by the system prompt. No extra text."
     )
     return prompt

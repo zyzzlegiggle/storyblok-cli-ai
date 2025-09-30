@@ -268,9 +268,7 @@ func runCreateWizard(cmd *cobra.Command) error {
 			"app_name":    appName,
 			"token":       token,
 		},
-		"storyblok_schema": map[string]interface{}{}, // backend can fetch or ask for schema if needed
 		"options": map[string]interface{}{
-			"typescript":    true,
 			"include_pages": true,
 			"debug":         true,
 		},
@@ -348,8 +346,7 @@ func runCreateWizard(cmd *cobra.Command) error {
 
 	// Build overlay request payload for backend
 	overlayPayload := map[string]interface{}{
-		"user_answers":     payload["user_answers"],
-		"storyblok_schema": payload["storyblok_schema"],
+		"user_answers": payload["user_answers"],
 		"options": map[string]interface{}{
 			"framework":      chosenFramework,
 			"packagemanager": chosenPM,
@@ -480,8 +477,7 @@ func runCreateWizard(cmd *cobra.Command) error {
 
 		// Build payload including previous_questions so backend can avoid repeats
 		qPayload := map[string]interface{}{
-			"user_answers":     payload["user_answers"],
-			"storyblok_schema": payload["storyblok_schema"],
+			"user_answers": payload["user_answers"],
 			"options": map[string]interface{}{
 				"request_questions":  true,
 				"max_questions":      roundQuestions,
@@ -1090,7 +1086,7 @@ func runStoryblokCreateAndCollect(framework, targetDir, token, packagemanager, r
 
 // callOverlayBackend posts the base scaffold to the backend overlay endpoint and returns parsed JSON.
 // backendOverlayURL should be full e.g. http://127.0.0.1:8000/generate/overlay
-// payload fields: user_answers, storyblok_schema, options, base_files
+// payload fields: user_answers, options, base_files
 func callOverlayBackend(backendOverlayURL string, payload map[string]interface{}) (map[string]interface{}, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {

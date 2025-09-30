@@ -23,7 +23,7 @@ from typing import Dict, Any, List, Optional, AsyncGenerator
 import requests
 
 from core.llm_client import call_structured_generation, GenerateResponseModel
-from core.prompts import build_system_prompt, build_user_prompt, summarize_schema
+from core.prompts import build_system_prompt, build_user_prompt
 from core.dep_resolver import resolve_and_pin_files
 from core.validator import run_validations, attempt_repair
 from core.followup_agent import generate_followup_questions  # localized import
@@ -42,12 +42,6 @@ NPM_CACHE_FILE = os.path.join(LOG_DIR, "npm_cache.pkl")
 NPM_CACHE_TTL = 24 * 3600  # seconds
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# ----------------------------
-# Utilities & validation
-# ----------------------------
-def chunk_components(components: List[Dict[str, Any]], chunk_size: int = CHUNK_SIZE):
-    for i in range(0, len(components), chunk_size):
-        yield components[i:i + chunk_size]
 
 
 def _ensure_parsed_dict(name: str, parsed) -> Dict[str, Any]:
@@ -112,7 +106,6 @@ async def stream_generate_project(payload: Dict[str, Any]) -> AsyncGenerator[str
     Mirrors prior streaming behavior but lives in this agent.
     """
     user_answers = payload.get("user_answers", {}) or {}
-    schema = payload.get("storyblok_schema", {}) or {}
     options = payload.get("options", {}) or {}
     debug = bool(options.get("debug", False))
     followup_answers = user_answers.get("followup_answers", {}) or {}
@@ -122,7 +115,7 @@ async def stream_generate_project(payload: Dict[str, Any]) -> AsyncGenerator[str
     system_prompt = build_system_prompt()
     user_for_prompt = dict(user_answers)
     user_for_prompt.update({"followup_answers": followup_answers})
-    user_prompt = build_user_prompt(user_for_prompt, schema, options)
+    user_prompt = build_user_prompt(user_for_prompt, options)
 
     # Diagnostic / question generation - if caller requested, we early-return followups (NOT used in stream path here)
     request_questions = bool(options.get("request_questions", False))
@@ -135,8 +128,6 @@ async def stream_generate_project(payload: Dict[str, Any]) -> AsyncGenerator[str
             yield await _yield_event("followups", followups)
             return
 
-    # Generation: handle components or single-shot
-    components = schema.get("components", []) or []
     accumulated_files: List[Dict[str, str]] = []
     llm_debug_all = []
     merged_warnings = []
@@ -161,31 +152,30 @@ async def stream_generate_project(payload: Dict[str, Any]) -> AsyncGenerator[str
                 yield await _yield_event("file_chunk", {"path": path, "chunk": chunk, "index": i//STREAM_CHUNK_SZ, "final": final})
             yield await _yield_event("file_complete", {"path": path, "size": len(content)})
 
-    if not components:
-        # build base_files_map if provided in payload
-        base_files_map = {}
-        normalized_assets = set()
-        if isinstance(payload.get("asset_files"), list):
-            for a in payload.get("asset_files", []):
-                na = _safe_normalize(a) if callable(globals().get("_safe_normalize", None)) else None
-                if na:
-                    normalized_assets.add(na)
-        if isinstance(payload.get("base_files"), list):
-            for bf in payload.get("base_files", []):
-                if isinstance(bf, dict):
-                    p = bf.get("path") or ""
-                    # skip if path is provided as asset
-                    np = _normalize_path(p)
-                    if np in normalized_assets:
-                        # explicitly treat as asset: set empty content or skip entirely
-                        base_files_map[np] = ""  # indicate asset placeholder
-                        continue
-                    c = bf.get("content") or ""
-                    base_files_map[np] = c
+    # build base_files_map if provided in payload
+    base_files_map = {}
+    normalized_assets = set()
+    if isinstance(payload.get("asset_files"), list):
+        for a in payload.get("asset_files", []):
+            na = _safe_normalize(a) if callable(globals().get("_safe_normalize", None)) else None
+            if na:
+                normalized_assets.add(na)
+    if isinstance(payload.get("base_files"), list):
+        for bf in payload.get("base_files", []):
+            if isinstance(bf, dict):
+                p = bf.get("path") or ""
+                # skip if path is provided as asset
+                np = _normalize_path(p)
+                if np in normalized_assets:
+                    # explicitly treat as asset: set empty content or skip entirely
+                    base_files_map[np] = ""  # indicate asset placeholder
+                    continue
+                c = bf.get("content") or ""
+                base_files_map[np] = c
 
 
         if base_files_map:
-            overlay_user_prompt = _build_overlay_user_prompt(user_for_prompt, schema, options, base_files_map)
+            overlay_user_prompt = _build_overlay_user_prompt(user_for_prompt, options, base_files_map)
             full_prompt = system_prompt + "\n" + overlay_user_prompt + "\n\nReturn JSON with project_name, files[], new_dependencies, metadata."
         else:
             full_prompt = system_prompt + "\n" + user_prompt + "\n\nReturn JSON with project_name, files[], metadata."
@@ -212,24 +202,6 @@ async def stream_generate_project(payload: Dict[str, Any]) -> AsyncGenerator[str
         if debug:
             llm_debug_all.append(parsed)
     else:
-        # chunked generation
-        total_files_so_far = 0
-        for idx, chunk in enumerate(chunk_components(components, CHUNK_SIZE)):
-            chunk_schema = {"components": chunk}
-            chunk_user_prompt = build_user_prompt(user_for_prompt, chunk_schema, options)
-            chunk_prompt = system_prompt + "\n" + chunk_user_prompt + "\n\nReturn JSON with files[] (only files for these components)."
-            parsed = await call_structured_generation(chunk_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
-            parsed = _ensure_parsed_dict(f"chunk_{idx}_gen", parsed)
-            _log_raw_llm_output("stream_chunk", parsed, debug)
-            files = parsed.get("files", []) or []
-            async for ev in _stream_files_list(files):
-                yield ev
-            if parsed.get("metadata", {}).get("warnings"):
-                for w in parsed.get("metadata", {}).get("warnings"):
-                    yield await _yield_event("warning", w)
-            if debug:
-                llm_debug_all.append(parsed)
-
         # scaffold
         scaffold_prompt = system_prompt + "\n" + user_prompt + "\n\nNow produce project-level scaffolding files (package.json, tsconfig, pages, services, env files). Return JSON with files[]."
         parsed_scaffold = await call_structured_generation(scaffold_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
@@ -346,7 +318,6 @@ async def generate_project(payload: Dict[str, Any]) -> Dict[str, Any]:
     shape: returns {"project_name":..., "files":[{"path","content"}], "metadata": {...}}
     """
     user_answers = payload.get("user_answers", {}) or {}
-    schema = payload.get("storyblok_schema", {}) or {}
     options = payload.get("options", {}) or {}
     debug = bool(options.get("debug", False))
     followup_answers = user_answers.get("followup_answers", {}) or {}
@@ -356,7 +327,7 @@ async def generate_project(payload: Dict[str, Any]) -> Dict[str, Any]:
     system_prompt = build_system_prompt()
     user_for_prompt = dict(user_answers)
     user_for_prompt.update({"followup_answers": followup_answers})
-    user_prompt = build_user_prompt(user_for_prompt, schema, options)
+    user_prompt = build_user_prompt(user_for_prompt, options)
 
     # Diagnostic / question generation (canonical path: use followup agent if requested)
     try:
@@ -370,7 +341,6 @@ async def generate_project(payload: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
-    components = schema.get("components", []) or []
     generated_files: List[Dict[str, str]] = []
     merged_warnings: List[str] = []
     llm_debug_all = []
@@ -385,63 +355,39 @@ async def generate_project(payload: Dict[str, Any]) -> Dict[str, Any]:
                 np = _normalize_path(p)
                 base_files_map[np] = c
 
-    if not components:
-        # if we have a base scaffold, ask model to act as overlay
-        if base_files_map:
-            overlay_user_prompt = _build_overlay_user_prompt(user_for_prompt, schema, options, base_files_map)
-            full_prompt = system_prompt + "\n" + overlay_user_prompt + "\n\nReturn JSON with project_name, files[], new_dependencies, metadata."
-        else:
-            full_prompt = system_prompt + "\n" + user_prompt + "\n\nReturn JSON with project_name, files[], metadata."
-
-        parsed = await call_structured_generation(full_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
-        parsed = _ensure_parsed_dict("full_gen", parsed)
-        _log_raw_llm_output("generate_project_full", parsed, debug)
-
-        files = parsed.get("files", []) or []
-        # compute delta if overlay context provided
-        if base_files_map:
-            files = _compute_delta_files(files, base_files_map)
-        generated_files.extend(files)
-        # attach any new_dependencies into metadata for CLI to pick up
-        if base_files_map:
-            nd = parsed.get("new_dependencies") or parsed.get("metadata", {}).get("new_dependencies")
-            if nd:
-                if isinstance(nd, list):
-                    dep_list = [d for d in nd if isinstance(d, str)]
-                    # record compactly in metadata for later usage
-                    merged_warnings.extend(parsed.get("metadata", {}).get("warnings", []) or [])
-                    # stash dep meta for the response
-                    dep_meta_for_resp = {"new_dependencies": dep_list}
-                    # attach into parsed metadata so outer code can pick it up
-                    parsed.setdefault("metadata", {}).setdefault("dependencies", {}).update(dep_meta_for_resp)
-
-        if parsed.get("metadata", {}).get("warnings"):
-            merged_warnings.extend(parsed.get("metadata", {}).get("warnings"))
-        if debug:
-            llm_debug_all.append(parsed)
+    # if we have a base scaffold, ask model to act as overlay
+    if base_files_map:
+        overlay_user_prompt = _build_overlay_user_prompt(user_for_prompt, options, base_files_map)
+        full_prompt = system_prompt + "\n" + overlay_user_prompt + "\n\nReturn JSON with project_name, files[], new_dependencies, metadata."
     else:
-        for idx, chunk in enumerate(chunk_components(components, CHUNK_SIZE)):
-            chunk_schema = {"components": chunk}
-            chunk_user_prompt = build_user_prompt(user_for_prompt, chunk_schema, options)
-            chunk_prompt = system_prompt + "\n" + chunk_user_prompt + "\n\nReturn JSON with files[] (only files for these components)."
-            parsed = await call_structured_generation(chunk_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
-            parsed = _ensure_parsed_dict(f"chunk_{idx}_gen", parsed)
-            files = parsed.get("files", []) or []
-            generated_files.extend(files)
-            if parsed.get("metadata", {}).get("warnings"):
-                merged_warnings.extend(parsed.get("metadata", {}).get("warnings"))
-            if debug:
-                llm_debug_all.append(parsed)
+        full_prompt = system_prompt + "\n" + user_prompt + "\n\nReturn JSON with project_name, files[], metadata."
 
-        scaffold_prompt = system_prompt + "\n" + user_prompt + "\n\nNow produce project-level scaffolding files (package.json, tsconfig, pages, services, env files, etc.). Return JSON with files[]."
-        parsed_scaffold = await call_structured_generation(scaffold_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
-        parsed_scaffold = _ensure_parsed_dict("scaffold_gen", parsed_scaffold)
-        scaffold_files = parsed_scaffold.get("files", []) or []
-        generated_files.extend(scaffold_files)
-        if parsed_scaffold.get("metadata", {}).get("warnings"):
-            merged_warnings.extend(parsed_scaffold.get("metadata", {}).get("warnings"))
-        if debug:
-            llm_debug_all.append(parsed_scaffold)
+    parsed = await call_structured_generation(full_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
+    parsed = _ensure_parsed_dict("full_gen", parsed)
+    _log_raw_llm_output("generate_project_full", parsed, debug)
+
+    files = parsed.get("files", []) or []
+    # compute delta if overlay context provided
+    if base_files_map:
+        files = _compute_delta_files(files, base_files_map)
+    generated_files.extend(files)
+    # attach any new_dependencies into metadata for CLI to pick up
+    if base_files_map:
+        nd = parsed.get("new_dependencies") or parsed.get("metadata", {}).get("new_dependencies")
+        if nd:
+            if isinstance(nd, list):
+                dep_list = [d for d in nd if isinstance(d, str)]
+                # record compactly in metadata for later usage
+                merged_warnings.extend(parsed.get("metadata", {}).get("warnings", []) or [])
+                # stash dep meta for the response
+                dep_meta_for_resp = {"new_dependencies": dep_list}
+                # attach into parsed metadata so outer code can pick it up
+                parsed.setdefault("metadata", {}).setdefault("dependencies", {}).update(dep_meta_for_resp)
+
+    if parsed.get("metadata", {}).get("warnings"):
+        merged_warnings.extend(parsed.get("metadata", {}).get("warnings"))
+    if debug:
+        llm_debug_all.append(parsed)
 
     # sanitize & dedupe
     seen = set()
@@ -555,7 +501,6 @@ def _normalize_path(p: str) -> str:
 
 def _build_overlay_user_prompt(
     user_for_prompt: Dict[str, Any],
-    schema: Dict[str, Any],
     options: Dict[str, Any],
     base_files_map: Dict[str, str],
     asset_files: Optional[List[str]] = None  # optional list of asset paths
@@ -564,13 +509,13 @@ def _build_overlay_user_prompt(
     Build a user prompt that instructs the LLM to act as an overlay when base_files_map is provided.
     Includes asset placeholders so the LLM knows these exist but does not get their contents.
     """
-    schema_summary = summarize_schema(schema)
     try:
         user_json = json.dumps(user_for_prompt, indent=2, ensure_ascii=False)
     except Exception:
         user_json = str(user_for_prompt)
 
     normalized_assets = set(asset_files or [])
+    print(base_files_map)
 
     # small manifest: path + snippet (first ~600 chars) for context
     manifest = []
@@ -584,7 +529,6 @@ def _build_overlay_user_prompt(
     prompt = (
         "Context:\n"
         f"User requirements:\n{user_json}\n\n"
-        f"Storyblok schema summary:\n{schema_summary}\n\n"
         "Existing scaffold manifest (path + snippet):\n"
         f"{json.dumps(manifest, ensure_ascii=False)}\n\n"
         "Task:\n"

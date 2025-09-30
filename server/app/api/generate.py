@@ -6,7 +6,6 @@ from fastapi.responses import StreamingResponse
 from core.codegen_agent import generate_project, stream_generate_project
 from core.followup_agent import generate_followup_questions
 from core.llm_client import call_structured_generation
-from core.prompts import summarize_schema
 import json
 import os
 import traceback
@@ -21,7 +20,6 @@ router = APIRouter()
 
 class GenerateRequest(BaseModel):
     user_answers: Dict[str, Any]
-    storyblok_schema: Dict[str, Any]
     options: Optional[Dict[str, Any]] = {}
     base_files: Optional[List[Dict[str, Any]]] = None
     asset_files: Optional[List[str]] = None
@@ -89,7 +87,6 @@ async def generate_overlay(request: Dict[str, Any]):
     Request JSON:
       {
         "user_answers": {...},
-        "storyblok_schema": {...},   # optional
         "options": {...},
         "base_files": [ {"path": "src/...", "content": "..."}, ... ]
       }
@@ -103,7 +100,6 @@ async def generate_overlay(request: Dict[str, Any]):
     try:
         
         user_answers = request.get("user_answers", {}) or {}
-        schema = request.get("storyblok_schema", {}) or {}
         options = request.get("options", {}) or {}
 # --- inside generate_overlay(...) near the top after reading request dict ---
         base_files = request.get("base_files", []) or []
@@ -154,7 +150,6 @@ async def generate_overlay(request: Dict[str, Any]):
 
 
             # Build overlay-specific system + user prompt
-            schema_summary = summarize_schema(schema)
             # system prompt (concise rules)
             system_prompt = (
                 "You are an expert code generator that modifies an existing Storyblok demo scaffold.\n"
@@ -177,7 +172,6 @@ async def generate_overlay(request: Dict[str, Any]):
             user_prompt = (
                 "Context:\n"
                 f"User answers: {json.dumps(user_answers, ensure_ascii=False)}\n\n"
-                f"Storyblok schema summary:\n{schema_summary}\n\n"
                 f"Scaffold manifest (path + snippet):\n{json.dumps(manifest, ensure_ascii=False)}\n\n"
                 "Task:\n"
                 "- Make the smallest set of file changes required to implement the user's requests.\n"
