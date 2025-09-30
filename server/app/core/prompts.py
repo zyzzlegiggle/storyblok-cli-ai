@@ -103,7 +103,7 @@ def build_system_prompt(model_name: Optional[str] = None) -> str:
     Clear, short rules to reduce accidental extra text.
     """
     return (
-        "You are an expert and creative code generator producing NextJS React frontends wired to Storyblok with Tailwind styling.\n"
+        "You are an expert and creative code generator producing frontends wired to Storyblok.\n"
         "OUTPUT RULES:\n"
         " - Return EXACTLY one valid JSON object and nothing else.\n"
         " - Top-level keys must include: project_name, files, dependencies, metadata, warnings, followups.\n"
@@ -206,7 +206,7 @@ def build_user_prompt(user_answers: Dict[str, Any], schema: Dict[str, Any], opti
         f"Storyblok schema summary:\n{schema_summary}\n\n"
         f"Options:\n{opt_json}\n\n"
         "Generation instructions:\n"
-        " 1) Produce a runnable frontend scaffold (React + Storyblok) matching the user's requirements.\n"
+        " 1) Produce a runnable frontend scaffold matching the user's requirements.\n"
         " 2) Include minimal scaffolding files: package.json, build config, basic pages, Storyblok client, and representative components.\n"
         " 3) Only list dependency NAMES in 'dependencies' (no versions).\n"
         " 4) If any required information is missing, set 'followups' to a non-empty array (strings) and leave 'files' empty.\n"

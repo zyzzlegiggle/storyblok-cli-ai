@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
@@ -201,13 +202,6 @@ func parseFilesFromResponse(resp map[string]interface{}) []scaffold.FileOut {
 	return out
 }
 
-// ---------------- Helper: read stream events ----------------
-
-type streamEvent struct {
-	Event   string      `json:"event"`
-	Payload interface{} `json:"payload"`
-}
-
 // read one JSON line (ndjson) from reader
 func readJSONLine(r *bufio.Reader) ([]byte, error) {
 	line, err := r.ReadBytes('\n')
@@ -285,6 +279,184 @@ func runCreateWizard(cmd *cobra.Command) error {
 	backendStreamURL := "http://127.0.0.1:8000/generate/stream"
 	backendURL := "http://127.0.0.1:8000/generate/"
 
+	// ask user which Storyblok demo framework to use (restricted list)
+	var chosenFramework string
+	frameworkPrompt := &survey.Select{
+		Message: "Choose a base framework for the Storyblok demo scaffold:",
+		Options: allowedFrameworks,
+		Default: allowedFrameworks[0],
+	}
+	if err := survey.AskOne(frameworkPrompt, &chosenFramework); err != nil {
+		return fmt.Errorf("framework prompt aborted: %w", err)
+	}
+
+	// ask package manager (npm or yarn)
+	var chosenPM string
+	pmPrompt := &survey.Select{
+		Message: "Choose package manager for the scaffold:",
+		Options: []string{"npm", "yarn"},
+		Default: "npm",
+	}
+	if err := survey.AskOne(pmPrompt, &chosenPM); err != nil {
+		return fmt.Errorf("package manager prompt aborted: %w", err)
+	}
+
+	// Region selection (replace previous freeform region input)
+	var regionChoice string
+	regionPrompt := &survey.Select{
+		Message: "Space Region (optional, EU is used by default):",
+		Options: []string{
+			"EU - Europe",
+			"US - United States",
+			"CN - China",
+			"CA - Canada",
+		},
+		Default: "EU - Europe",
+	}
+	if err := survey.AskOne(regionPrompt, &regionChoice); err != nil {
+		return fmt.Errorf("region prompt aborted: %w", err)
+	}
+
+	// map friendly label -> storyblok CLI region codes (example tokens)
+	regionMap := map[string]string{
+		"EU - Europe":        "eu-central-1",
+		"US - United States": "us-east-1",
+		"CN - China":         "cn-north-1",
+		"CA - Canada":        "ca-central-1",
+	}
+
+	// resolve chosenRegion; if not present default to EU
+	chosenRegion := regionMap["EU - Europe"]
+	if v, ok := regionMap[regionChoice]; ok && strings.TrimSpace(v) != "" {
+		chosenRegion = v
+	}
+
+	// absTarget should already be resolved from user project name
+	preExists := exists(absTarget)
+	if preExists {
+		return fmt.Errorf("target directory already exists: %s (remove or choose another name)", absTarget)
+	}
+
+	_, baseFiles, err := runStoryblokCreateAndCollect(chosenFramework, absTarget, token, chosenPM, chosenRegion)
+	if err != nil {
+		// If the CLI failed and we didn't have the target before, cleanup the partially created dir
+		if !preExists {
+			_ = os.RemoveAll(absTarget)
+		}
+		return fmt.Errorf("storyblok scaffold failed: %w", err)
+	}
+
+	// Build overlay request payload for backend
+	overlayPayload := map[string]interface{}{
+		"user_answers":     payload["user_answers"],
+		"storyblok_schema": payload["storyblok_schema"],
+		"options": map[string]interface{}{
+			"framework":      chosenFramework,
+			"packagemanager": chosenPM,
+			"region":         chosenRegion,
+			"debug":          payload["options"].(map[string]interface{})["debug"],
+		},
+		"base_files": baseFiles, // will be marshaled as JSON array of {path,content}
+	}
+
+	if b, err := json.MarshalIndent(payload, "", "  "); err == nil {
+		fmt.Println("---- BACKEND REQUEST PAYLOAD ----")
+		fmt.Println(string(b))
+		fmt.Println("--------------------------------")
+	} else {
+		fmt.Println("Failed to marshal payload for debug:", err)
+	}
+
+	// Call overlay endpoint (make sure your backend has /generate/overlay)
+	backendOverlayURL := "http://127.0.0.1:8000/generate/overlay"
+	fmt.Println("Sending scaffold to overlay backend for customization...")
+	overlayResp, err := callOverlayBackend(backendOverlayURL, overlayPayload)
+	if err != nil {
+		return fmt.Errorf("overlay backend failed: %w", err)
+	}
+
+	// Parse response: expect {"files": [...], "new_dependencies": [...], "warnings": [...]}
+	var changedFilesRaw []map[string]interface{}
+	if filesRaw, ok := overlayResp["files"]; ok {
+		if arr, ok := filesRaw.([]interface{}); ok {
+			for _, it := range arr {
+				if m, ok := it.(map[string]interface{}); ok {
+					changedFilesRaw = append(changedFilesRaw, m)
+				}
+			}
+		}
+	}
+
+	// Parse new dependencies (names only)
+	newDeps := []string{}
+	if nd, ok := overlayResp["new_dependencies"]; ok {
+		if arr, ok := nd.([]interface{}); ok {
+			for _, it := range arr {
+				if s, ok := it.(string); ok && strings.TrimSpace(s) != "" {
+					newDeps = append(newDeps, s)
+				}
+			}
+		}
+	}
+
+	// Apply overlay into the scaffold workspace (absTarget). This writes changed files and merges new deps into package.json.
+	written, err := applyOverlayToScaffold(absTarget, changedFilesRaw, newDeps)
+	if err != nil {
+		return fmt.Errorf("applying overlay to scaffold failed: %w", err)
+	}
+	fmt.Printf("Applied overlay: %d files written/updated.\n", len(written))
+
+	// Collect final files from absTarget (now include package.json)
+	finalFiles := []scaffold.FileOut{}
+	err = filepath.WalkDir(absTarget, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			// ignore problematic files but continue
+			return nil
+		}
+		rel, _ := filepath.Rel(absTarget, path)
+		rel = filepath.ToSlash(rel)
+		// skip node_modules and .git
+		if d.IsDir() {
+			if rel == "node_modules" || strings.HasPrefix(rel, "node_modules/") {
+				return filepath.SkipDir
+			}
+			if rel == ".git" || strings.HasPrefix(rel, ".git/") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		// read file
+		ext := strings.ToLower(filepath.Ext(rel))
+		switch ext {
+		case ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp":
+			// don’t include binary contents, just mark as asset
+			finalFiles = append(finalFiles, scaffold.FileOut{
+				Path:    rel,
+				Content: "[[binary asset: " + rel + "]]",
+			})
+			return nil
+		}
+
+		b, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return nil
+		}
+		finalFiles = append(finalFiles, scaffold.FileOut{Path: rel, Content: string(b)})
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("collecting final scaffold files: %w", err)
+	}
+
+	fmt.Println("Storyblok scaffold + overlay applied. Project created at:", absTarget)
+	if len(newDeps) > 0 {
+		fmt.Println("\n⚠️  Note: the backend suggested new dependencies (names only). They were merged into package.json as placeholders.")
+		fmt.Println("Run `npm install` (or your package manager) to install and pin them, or use the CLI's dependency pinning step.")
+	}
+
+	// proceed to the rest of the flow (followups / generation pipeline / streaming) as before
+
 	// --- before the iterative rounds, declare helpers/state ---
 	questionTexts := map[string]string{} // id -> question text
 	currentRound := 0
@@ -301,25 +473,9 @@ func runCreateWizard(cmd *cobra.Command) error {
 	}
 
 	for round := 1; round <= maxFollowupRounds; round++ {
+		currentRound = round
 		// UI preview: show previous followup answers to the user
 		userAns, _ := payload["user_answers"].(map[string]interface{})
-		fmt.Printf("\n--- Round %d followups ---\n", round)
-		if userAns != nil {
-			if fa, ok := userAns["followup_answers"].(map[string]interface{}); ok && len(fa) > 0 {
-				fmt.Println("Previous answers (summary):")
-				count := 0
-				for k, v := range fa {
-					if count >= 6 { // keep preview short
-						fmt.Println("  ...")
-						break
-					}
-					fmt.Printf("  - %s: %v\n", k, v)
-					count++
-				}
-			} else {
-				fmt.Println("No previous followup answers.")
-			}
-		}
 
 		// Build payload including previous_questions so backend can avoid repeats
 		qPayload := map[string]interface{}{
@@ -336,7 +492,7 @@ func runCreateWizard(cmd *cobra.Command) error {
 			},
 		}
 
-		qResp, err = callBackend(backendURL+"questions", qPayload)
+		qResp, err := callBackend(backendURL+"questions", qPayload)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: question-generation failed (round %d): %v\n", round, err)
 			// fallback to generic prompt only on first round
@@ -475,7 +631,7 @@ func runCreateWizard(cmd *cobra.Command) error {
 		// continue to next round (backend will be posted again with updated followup_answers)
 	}
 
-	// 5) followup loop
+	// 5) followup loop (streaming)
 	maxRounds := 20
 	for round := 1; round < maxRounds; round++ {
 		currentRound = round
@@ -505,9 +661,6 @@ func runCreateWizard(cmd *cobra.Command) error {
 				files := parseFilesFromResponse(respMap)
 				if len(files) == 0 {
 					return fmt.Errorf("backend returned no files and no followups")
-				}
-				if err := scaffold.WriteFilesAtomically(files, absTarget); err != nil {
-					return fmt.Errorf("writing project files: %w", err)
 				}
 				fmt.Println("Project created successfully at:", absTarget)
 				fmt.Println("\n⚠️  Security note:")
@@ -674,6 +827,7 @@ func runCreateWizard(cmd *cobra.Command) error {
 				if !ok {
 					// create if not present
 					tf = filepath.Join(tmpDir, strings.ReplaceAll(path, "/", "__"))
+					_ = os.MkdirAll(filepath.Dir(tf), 0o755)
 					_ = os.WriteFile(tf, []byte(""), 0o644)
 					tempFiles[path] = tf
 				}
@@ -704,7 +858,11 @@ func runCreateWizard(cmd *cobra.Command) error {
 			case "file_complete":
 				m, _ := payloadEv.(map[string]interface{})
 				path, _ := m["path"].(string)
-				tf := tempFiles[path]
+				tf, ok := tempFiles[path]
+				if !ok {
+					// missing temp file; skip
+					continue
+				}
 
 				// read temp file into memory
 				contentBytes, _ := os.ReadFile(tf)
@@ -773,11 +931,6 @@ func runCreateWizard(cmd *cobra.Command) error {
 			continue
 		}
 
-		// final: write files atomically from completedFiles
-		if err := scaffold.WriteFilesAtomically(completedFiles, absTarget); err != nil {
-			return fmt.Errorf("writing project files: %w", err)
-		}
-
 		fmt.Println("Project created successfully at:", absTarget)
 
 		fmt.Println("\n⚠️  Security note:")
@@ -838,4 +991,178 @@ func stableIDForQuestion(round int, index int, question string) string {
 	// prefer hash of question for stability across runs
 	h := md5.Sum([]byte(strings.ToLower(strings.TrimSpace(question))))
 	return fmt.Sprintf("r%d_q%d_%s", round, index, hex.EncodeToString(h[:4])) // short hash
+}
+
+// Allowed frameworks the user may choose
+var allowedFrameworks = []string{"astro", "react", "nextjs", "sveltekit", "vue", "nuxt"}
+
+// runStoryblokCreateAndCollect runs the Storyblok create-demo CLI into `targetDir` and
+// returns the absolute path and a list of scaffold.FileOut (excluding package.json & lockfiles).
+// targetDir should be a path (can be a temp dir or a real path). It will be created if missing.
+func runStoryblokCreateAndCollect(framework, targetDir, token, packagemanager, region string) (string, []scaffold.FileOut, error) {
+
+	// build npx args. Use --yes to avoid prompts when possible.
+	args := []string{"--yes", "@storyblok/create-demo@latest", "-d", targetDir, "-f", framework}
+	if token != "" {
+		args = append(args, "-k", token)
+	}
+	if packagemanager != "" {
+		args = append(args, "-p", packagemanager)
+	}
+	if region != "" {
+		args = append(args, "-r", region)
+	}
+
+	cmd := exec.Command("npx", args...)
+	// run in the current working directory; CI environments may require env adjustments
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", nil, fmt.Errorf("running storyblok create failed: %w", err)
+	}
+
+	// Walk the generated folder and collect files, excluding package.json and lockfiles and node_modules/.git
+	collected := []scaffold.FileOut{}
+	err := filepath.WalkDir(targetDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			// ignore problematic files but continue
+			return nil
+		}
+		rel, _ := filepath.Rel(targetDir, path)
+
+		rel = filepath.ToSlash(rel)
+		// Skip directories we don't want to descend into
+		if d.IsDir() {
+			// skip node_modules and .git
+			if rel == "node_modules" || strings.HasPrefix(rel, "node_modules/") {
+				return filepath.SkipDir
+			}
+			if rel == ".git" || strings.HasPrefix(rel, ".git/") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		// skip package.json and known lockfiles
+		base := filepath.Base(path)
+		if base == "package.json" || base == "package-lock.json" || base == "yarn.lock" || base == "pnpm-lock.yaml" {
+			return nil
+		}
+		// read file
+		b, rerr := os.ReadFile(path)
+		if rerr != nil {
+			// ignore read errors
+			return nil
+		}
+		collected = append(collected, scaffold.FileOut{Path: rel, Content: string(b)})
+		return nil
+	})
+	if err != nil {
+		// non-fatal: return what we collected and the error
+		return targetDir, collected, fmt.Errorf("walking generated dir: %w", err)
+	}
+
+	return targetDir, collected, nil
+}
+
+// callOverlayBackend posts the base scaffold to the backend overlay endpoint and returns parsed JSON.
+// backendOverlayURL should be full e.g. http://127.0.0.1:8000/generate/overlay
+// payload fields: user_answers, storyblok_schema, options, base_files
+func callOverlayBackend(backendOverlayURL string, payload map[string]interface{}) (map[string]interface{}, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal overlay request: %w", err)
+	}
+	req, err := http.NewRequest("POST", backendOverlayURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 180 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("call overlay backend: %w", err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("overlay backend returned status %d: %s", resp.StatusCode, string(b))
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(b, &parsed); err != nil {
+		return nil, fmt.Errorf("parse backend overlay response: %w", err)
+	}
+	return parsed, nil
+}
+
+// applyOverlayToScaffold writes the changed files returned by the backend into the scaffoldDir
+// and merges newDependencies into scaffoldDir/package.json as dependency placeholders ("*").
+// It returns a list of written files and any warning errors encountered.
+func applyOverlayToScaffold(scaffoldDir string, changedFiles []map[string]interface{}, newDependencies []string) ([]string, error) {
+	written := []string{}
+	// write changed files (overwrite or create)
+	for _, f := range changedFiles {
+		pathIface, ok := f["path"]
+		if !ok {
+			continue
+		}
+		contentIface, _ := f["content"]
+		pathStr, ok := pathIface.(string)
+		if !ok || strings.TrimSpace(pathStr) == "" {
+			continue
+		}
+		contentStr, _ := contentIface.(string)
+		target := filepath.Join(scaffoldDir, filepath.FromSlash(pathStr))
+
+		if err := os.WriteFile(target, []byte(contentStr), 0o644); err != nil {
+			return written, fmt.Errorf("write file %s: %w", target, err)
+		}
+		written = append(written, pathStr)
+	}
+
+	// merge dependencies into package.json using "*" placeholder
+	pkgPath := filepath.Join(scaffoldDir, "package.json")
+	pkgBytes, err := os.ReadFile(pkgPath)
+	if err != nil {
+		// If package.json missing, still return the written files and warn
+		if len(newDependencies) > 0 {
+			return written, fmt.Errorf("package.json not found in scaffold; cannot merge dependencies")
+		}
+		return written, nil
+	}
+	var pj map[string]interface{}
+	if err := json.Unmarshal(pkgBytes, &pj); err != nil {
+		return written, fmt.Errorf("invalid package.json: %w", err)
+	}
+	// Ensure dependencies map exists
+	deps, ok := pj["dependencies"].(map[string]interface{})
+	if !ok || deps == nil {
+		deps = map[string]interface{}{}
+	}
+	for _, d := range newDependencies {
+		if d == "" {
+			continue
+		}
+		if _, exists := deps[d]; !exists {
+			deps[d] = "*" // placeholder; pin locally later with resolver
+		}
+	}
+	pj["dependencies"] = deps
+	// write back package.json
+	updated, err := json.MarshalIndent(pj, "", "  ")
+	if err != nil {
+		return written, fmt.Errorf("marshal updated package.json: %w", err)
+	}
+	if err := os.WriteFile(pkgPath, updated, 0o644); err != nil {
+		return written, fmt.Errorf("write package.json: %w", err)
+	}
+
+	// NOTE: pinning to exact versions should be done after this step using your dep_resolver
+	// (e.g., call resolve_with_npm_lockfile_fully or run npm install --package-lock-only)
+	return written, nil
+}
+
+func exists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

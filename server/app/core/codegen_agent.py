@@ -162,12 +162,38 @@ async def stream_generate_project(payload: Dict[str, Any]) -> AsyncGenerator[str
             yield await _yield_event("file_complete", {"path": path, "size": len(content)})
 
     if not components:
-        full_prompt = system_prompt + "\n" + user_prompt + "\n\nReturn JSON with project_name, files[], metadata."
-        parsed = await call_structured_generation(full_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug, temperature=AGENT_TEMPERATURES["codegen"])
+        # build base_files_map if provided in payload
+        base_files_map = {}
+        if isinstance(payload.get("base_files"), list):
+            for bf in payload.get("base_files", []):
+                if isinstance(bf, dict):
+                    p = bf.get("path") or ""
+                    c = bf.get("content") or ""
+                    np = _normalize_path(p)
+                    base_files_map[np] = c
+
+        if base_files_map:
+            overlay_user_prompt = _build_overlay_user_prompt(user_for_prompt, schema, options, base_files_map)
+            full_prompt = system_prompt + "\n" + overlay_user_prompt + "\n\nReturn JSON with project_name, files[], new_dependencies, metadata."
+        else:
+            full_prompt = system_prompt + "\n" + user_prompt + "\n\nReturn JSON with project_name, files[], metadata."
+
+        parsed = await call_structured_generation(full_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
         parsed = _ensure_parsed_dict("full_gen", parsed)
         files = parsed.get("files", []) or []
+        if base_files_map:
+            files = _compute_delta_files(files, base_files_map)
         async for ev in _stream_files_list(files):
             yield ev
+        # emit new_dependencies event so CLI can print/apply them
+        if base_files_map:
+            nd = parsed.get("new_dependencies") or parsed.get("metadata", {}).get("new_dependencies")
+            if isinstance(nd, list) and nd:
+                try:
+                    yield await _yield_event("new_dependencies", nd)
+                except Exception:
+                    pass
+
         if parsed.get("metadata", {}).get("warnings"):
             for w in parsed.get("metadata", {}).get("warnings"):
                 yield await _yield_event("warning", w)
@@ -182,6 +208,7 @@ async def stream_generate_project(payload: Dict[str, Any]) -> AsyncGenerator[str
             chunk_prompt = system_prompt + "\n" + chunk_user_prompt + "\n\nReturn JSON with files[] (only files for these components)."
             parsed = await call_structured_generation(chunk_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
             parsed = _ensure_parsed_dict(f"chunk_{idx}_gen", parsed)
+            _log_raw_llm_output("stream_chunk", parsed, debug)
             files = parsed.get("files", []) or []
             async for ev in _stream_files_list(files):
                 yield ev
@@ -338,12 +365,46 @@ async def generate_project(payload: Dict[str, Any]) -> Dict[str, Any]:
     merged_warnings: List[str] = []
     llm_debug_all = []
 
+    # detect base_files passed in payload (overlay scenario)
+    base_files_map = {}
+    if isinstance(payload.get("base_files"), list):
+        for bf in payload.get("base_files", []):
+            if isinstance(bf, dict):
+                p = bf.get("path") or ""
+                c = bf.get("content") or ""
+                np = _normalize_path(p)
+                base_files_map[np] = c
+
     if not components:
-        full_prompt = system_prompt + "\n" + user_prompt + "\n\nReturn JSON with project_name, files[], metadata."
+        # if we have a base scaffold, ask model to act as overlay
+        if base_files_map:
+            overlay_user_prompt = _build_overlay_user_prompt(user_for_prompt, schema, options, base_files_map)
+            full_prompt = system_prompt + "\n" + overlay_user_prompt + "\n\nReturn JSON with project_name, files[], new_dependencies, metadata."
+        else:
+            full_prompt = system_prompt + "\n" + user_prompt + "\n\nReturn JSON with project_name, files[], metadata."
+
         parsed = await call_structured_generation(full_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
         parsed = _ensure_parsed_dict("full_gen", parsed)
+        _log_raw_llm_output("generate_project_full", parsed, debug)
+
         files = parsed.get("files", []) or []
+        # compute delta if overlay context provided
+        if base_files_map:
+            files = _compute_delta_files(files, base_files_map)
         generated_files.extend(files)
+        # attach any new_dependencies into metadata for CLI to pick up
+        if base_files_map:
+            nd = parsed.get("new_dependencies") or parsed.get("metadata", {}).get("new_dependencies")
+            if nd:
+                if isinstance(nd, list):
+                    dep_list = [d for d in nd if isinstance(d, str)]
+                    # record compactly in metadata for later usage
+                    merged_warnings.extend(parsed.get("metadata", {}).get("warnings", []) or [])
+                    # stash dep meta for the response
+                    dep_meta_for_resp = {"new_dependencies": dep_list}
+                    # attach into parsed metadata so outer code can pick it up
+                    parsed.setdefault("metadata", {}).setdefault("dependencies", {}).update(dep_meta_for_resp)
+
         if parsed.get("metadata", {}).get("warnings"):
             merged_warnings.extend(parsed.get("metadata", {}).get("warnings"))
         if debug:
@@ -473,3 +534,94 @@ async def generate_project(payload: Dict[str, Any]) -> Dict[str, Any]:
         resp["llm_debug"] = {"chunks": llm_debug_all}
 
     return resp
+
+
+# ----------------------------
+# Overlay helpers
+# ----------------------------
+def _normalize_path(p: str) -> str:
+    # make paths consistent for comparison
+    return os.path.normpath(p).replace("\\", "/").lstrip("/")
+
+def _build_overlay_user_prompt(user_for_prompt: Dict[str, Any], schema: Dict[str, Any], options: Dict[str, Any], base_files_map: Dict[str, str]) -> str:
+    """
+    Build a user prompt that instructs the LLM to act as an overlay when base_files_map is provided.
+    """
+    schema_summary = summarize_schema(schema)
+    try:
+        user_json = json.dumps(user_for_prompt, indent=2, ensure_ascii=False)
+    except Exception:
+        user_json = str(user_for_prompt)
+
+    # small manifest: path + snippet (first ~600 chars) for context
+    manifest = []
+    for p, c in list(base_files_map.items())[:200]:
+        snippet = (c or "")[:600].replace("\n", "\\n")
+        manifest.append({"path": p, "snippet": snippet})
+
+    prompt = (
+        "Context:\n"
+        f"User requirements:\n{user_json}\n\n"
+        f"Storyblok schema summary:\n{schema_summary}\n\n"
+        "Existing scaffold manifest (path + snippet):\n"
+        f"{json.dumps(manifest, ensure_ascii=False)}\n\n"
+        "Task:\n"
+        "- The project scaffold already exists (paths in the manifest). DO NOT regenerate the whole project.\n"
+        "- Return ONLY files you need to ADD or CHANGE to implement the user's requests.\n"
+        "- Do NOT modify 'package.json'. Instead, list any additional NPM packages (NAMES ONLY) in 'new_dependencies'.\n"
+        "- For changed files, return the full file content (not a diff). For new files, return full content.\n"
+        "- Keep changes minimal and avoid reformatting or renaming files unless required.\n\n"
+        "-Follow the file format, example, if its nextjs project, mainly using javascript files, then if you add components, use in javascript format, not in tsx.\n"
+        "-Do not add another storyblok packages\n"
+        "Output: produce a single JSON object with keys: project_name (optional), files (array of {path,content}), new_dependencies (array of package NAMES), warnings (optional).\n"
+        "Return only JSON and nothing else.\n"
+    )
+    return prompt
+
+def _compute_delta_files(emitted_files: List[Dict[str, str]], base_files_map: Dict[str, str]) -> List[Dict[str, str]]:
+    """
+    Compare emitted_files (list of {path,content}) against base_files_map (path -> content).
+    Return only files that are new or whose content differs. Always ignore any package.json emitted by model.
+    Paths are normalized for comparison.
+    """
+    delta = []
+    for f in emitted_files:
+        path = f.get("path") or ""
+        content = f.get("content") or ""
+        npath = _normalize_path(path)
+        if os.path.basename(npath) == "package.json":
+            # explicitly skip package.json modifications
+            continue
+        base_content = base_files_map.get(npath)
+        if base_content is None:
+            # new file
+            delta.append({"path": npath, "content": content})
+        else:
+            # differ? use exact string comparison
+            if base_content != content:
+                delta.append({"path": npath, "content": content})
+            else:
+                # identical; skip
+                continue
+    return delta
+
+
+import time
+
+def _log_raw_llm_output(tag: str, data: Any, debug: bool = False):
+    """
+    Write raw parsed/unparsed LLM output to ai_backend_logs for debugging.
+    Only logs when debug=True in options.
+    """
+    if not debug:
+        return
+    try:
+        os.makedirs("ai_backend_logs", exist_ok=True)
+        fname = os.path.join("ai_backend_logs", f"{int(time.time())}_{tag}.json")
+        with open(fname, "w", encoding="utf-8") as f:
+            if isinstance(data, (dict, list)):
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            else:
+                f.write(str(data))
+    except Exception as e:
+        print(f"[debug-log-failed] {e}")
