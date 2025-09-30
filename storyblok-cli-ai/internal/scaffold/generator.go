@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -263,6 +264,34 @@ func WriteFilesAtomically(files []FileOut, projectDir string) error {
 	}
 	if err := os.RemoveAll(tmp); err != nil {
 		return err
+	}
+	return nil
+}
+
+func WriteFilesMerge(files []FileOut, projectDir string) error {
+	absTarget, err := filepath.Abs(projectDir)
+	if err != nil {
+		return err
+	}
+	if !exists(absTarget) {
+		if err := os.MkdirAll(absTarget, 0o755); err != nil {
+			return err
+		}
+	}
+
+	for _, f := range files {
+		content, err := strconv.Unquote(`"` + f.Content + `"`)
+		if err != nil {
+			// fallback: use as-is
+			content = f.Content
+		}
+		fullPath := filepath.Join(projectDir, filepath.FromSlash(f.Path))
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+			return fmt.Errorf("mkdir failed for %s: %w", fullPath, err)
+		}
+		if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
+			return fmt.Errorf("write file failed for %s: %w", fullPath, err)
+		}
 	}
 	return nil
 }

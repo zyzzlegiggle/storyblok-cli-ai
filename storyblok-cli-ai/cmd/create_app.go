@@ -212,7 +212,6 @@ func readJSONLine(r *bufio.Reader) ([]byte, error) {
 }
 
 // ---------------- Main wizard ----------------
-var qResp map[string]interface{}
 
 func runCreateWizard(cmd *cobra.Command) error {
 	// 1) Single freeform prompt + token prompt
@@ -260,22 +259,6 @@ func runCreateWizard(cmd *cobra.Command) error {
 	if err != nil {
 		return fmt.Errorf("invalid target path: %w", err)
 	}
-
-	// 4) Build initial payload
-	payload := map[string]interface{}{
-		"user_answers": map[string]interface{}{
-			"description": description,
-			"app_name":    appName,
-			"token":       token,
-		},
-		"options": map[string]interface{}{
-			"include_pages": true,
-			"debug":         true,
-		},
-	}
-
-	backendStreamURL := "http://127.0.0.1:8000/generate/stream"
-	backendURL := "http://127.0.0.1:8000/generate/"
 
 	// ask user which Storyblok demo framework to use (restricted list)
 	var chosenFramework string
@@ -343,118 +326,6 @@ func runCreateWizard(cmd *cobra.Command) error {
 		}
 		return fmt.Errorf("storyblok scaffold failed: %w", err)
 	}
-
-	// Build overlay request payload for backend
-	overlayPayload := map[string]interface{}{
-		"user_answers": payload["user_answers"],
-		"options": map[string]interface{}{
-			"framework":      chosenFramework,
-			"packagemanager": chosenPM,
-			"region":         chosenRegion,
-			"debug":          payload["options"].(map[string]interface{})["debug"],
-		},
-		"base_files":  baseFiles,  // will be marshaled as JSON array of {path,content}
-		"asset_files": assetFiles, // list of binary asset paths (no bytes)
-	}
-
-	if b, err := json.MarshalIndent(payload, "", "  "); err == nil {
-		fmt.Println("---- BACKEND REQUEST PAYLOAD ----")
-		fmt.Println(string(b))
-		fmt.Println("--------------------------------")
-	} else {
-		fmt.Println("Failed to marshal payload for debug:", err)
-	}
-
-	// Call overlay endpoint (make sure your backend has /generate/overlay)
-	backendOverlayURL := "http://127.0.0.1:8000/generate/overlay"
-	fmt.Println("Sending scaffold to overlay backend for customization...")
-	overlayResp, err := callOverlayBackend(backendOverlayURL, overlayPayload)
-	if err != nil {
-		return fmt.Errorf("overlay backend failed: %w", err)
-	}
-
-	// Parse response: expect {"files": [...], "new_dependencies": [...], "warnings": [...]}
-	var changedFilesRaw []map[string]interface{}
-	if filesRaw, ok := overlayResp["files"]; ok {
-		if arr, ok := filesRaw.([]interface{}); ok {
-			for _, it := range arr {
-				if m, ok := it.(map[string]interface{}); ok {
-					changedFilesRaw = append(changedFilesRaw, m)
-				}
-			}
-		}
-	}
-
-	// Parse new dependencies (names only)
-	newDeps := []string{}
-	if nd, ok := overlayResp["new_dependencies"]; ok {
-		if arr, ok := nd.([]interface{}); ok {
-			for _, it := range arr {
-				if s, ok := it.(string); ok && strings.TrimSpace(s) != "" {
-					newDeps = append(newDeps, s)
-				}
-			}
-		}
-	}
-
-	// Apply overlay into the scaffold workspace (absTarget). This writes changed files and merges new deps into package.json.
-	written, err := applyOverlayToScaffold(absTarget, changedFilesRaw, newDeps)
-	if err != nil {
-		return fmt.Errorf("applying overlay to scaffold failed: %w", err)
-	}
-	fmt.Printf("Applied overlay: %d files written/updated.\n", len(written))
-
-	// Collect final files from absTarget (now include package.json)
-	finalFiles := []scaffold.FileOut{}
-	err = filepath.WalkDir(absTarget, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			// ignore problematic files but continue
-			return nil
-		}
-		rel, _ := filepath.Rel(absTarget, path)
-		rel = filepath.ToSlash(rel)
-		// skip node_modules and .git
-		if d.IsDir() {
-			if rel == "node_modules" || strings.HasPrefix(rel, "node_modules/") {
-				return filepath.SkipDir
-			}
-			if rel == ".git" || strings.HasPrefix(rel, ".git/") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		// read file
-		ext := strings.ToLower(filepath.Ext(rel))
-		switch ext {
-		case ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp":
-			// don’t include binary contents, just mark as asset
-			finalFiles = append(finalFiles, scaffold.FileOut{
-				Path:    rel,
-				Content: "[[binary asset: " + rel + "]]",
-			})
-			return nil
-		}
-
-		b, rerr := os.ReadFile(path)
-		if rerr != nil {
-			return nil
-		}
-		finalFiles = append(finalFiles, scaffold.FileOut{Path: rel, Content: string(b)})
-
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("collecting final scaffold files: %w", err)
-	}
-
-	fmt.Println("Storyblok scaffold + overlay applied. Project created at:", absTarget)
-	if len(newDeps) > 0 {
-		fmt.Println("\n⚠️  Note: the backend suggested new dependencies (names only). They were merged into package.json as placeholders.")
-		fmt.Println("Run `npm install` (or your package manager) to install and pin them, or use the CLI's dependency pinning step.")
-	}
-
-	// proceed to the rest of the flow (followups / generation pipeline / streaming) as before
-
 	// --- before the iterative rounds, declare helpers/state ---
 	questionTexts := map[string]string{} // id -> question text
 	currentRound := 0
@@ -469,6 +340,24 @@ func runCreateWizard(cmd *cobra.Command) error {
 		// lower + collapse whitespace
 		return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(s))), " ")
 	}
+
+	// 4) Build initial payload
+	payload := map[string]interface{}{
+		"user_answers": map[string]interface{}{
+			"description": description,
+			"app_name":    appName,
+			"token":       token,
+		},
+		"options": map[string]interface{}{
+			"include_pages": true,
+			"debug":         true,
+		},
+		"base_files":  baseFiles,  // will be marshaled as JSON array of {path,content}
+		"asset_files": assetFiles, // list of binary asset paths (no bytes)
+	}
+
+	backendStreamURL := "http://127.0.0.1:8000/generate/stream"
+	backendURL := "http://127.0.0.1:8000/generate/"
 
 	for round := 1; round <= maxFollowupRounds; round++ {
 		currentRound = round
@@ -490,6 +379,8 @@ func runCreateWizard(cmd *cobra.Command) error {
 		}
 
 		qResp, err := callBackend(backendURL+"questions", qPayload)
+		respBytes, _ := json.MarshalIndent(qResp, "", "  ")
+		fmt.Println("DEBUG backend response:\n", string(respBytes))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: question-generation failed (round %d): %v\n", round, err)
 			// fallback to generic prompt only on first round
@@ -779,6 +670,7 @@ func runCreateWizard(cmd *cobra.Command) error {
 		// read loop
 		for {
 			lineBytes, err := readJSONLine(reader)
+			fmt.Println("DEBUG raw line from stream:", string(lineBytes))
 			if err != nil {
 				if err == io.EOF {
 					break
@@ -792,6 +684,7 @@ func runCreateWizard(cmd *cobra.Command) error {
 				// ignore malformed line
 				continue
 			}
+			fmt.Println("DEBUG parsed event:", ev)
 			etype, _ := ev["event"].(string)
 			payloadEv := ev["payload"]
 
@@ -817,8 +710,10 @@ func runCreateWizard(cmd *cobra.Command) error {
 				tempFiles[path] = tf
 			case "file_chunk":
 				m, _ := payloadEv.(map[string]interface{})
+
 				path, _ := m["path"].(string)
 				chunk, _ := m["chunk"].(string)
+				fmt.Printf("DEBUG file chunk for %s: %s\n", path, chunk)
 				final, _ := m["final"].(bool)
 				tf, ok := tempFiles[path]
 				if !ok {
@@ -928,6 +823,9 @@ func runCreateWizard(cmd *cobra.Command) error {
 			continue
 		}
 
+		if err := scaffold.WriteFilesMerge(completedFiles, absTarget); err != nil {
+			return fmt.Errorf("writing files to project dir: %w", err)
+		}
 		fmt.Println("Project created successfully at:", absTarget)
 
 		fmt.Println("\n⚠️  Security note:")
@@ -1082,103 +980,6 @@ func runStoryblokCreateAndCollect(framework, targetDir, token, packagemanager, r
 	}
 
 	return targetDir, collected, assets, nil
-}
-
-// callOverlayBackend posts the base scaffold to the backend overlay endpoint and returns parsed JSON.
-// backendOverlayURL should be full e.g. http://127.0.0.1:8000/generate/overlay
-// payload fields: user_answers, options, base_files
-func callOverlayBackend(backendOverlayURL string, payload map[string]interface{}) (map[string]interface{}, error) {
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("marshal overlay request: %w", err)
-	}
-	req, err := http.NewRequest("POST", backendOverlayURL, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 180 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("call overlay backend: %w", err)
-	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("overlay backend returned status %d: %s", resp.StatusCode, string(b))
-	}
-	var parsed map[string]interface{}
-	if err := json.Unmarshal(b, &parsed); err != nil {
-		return nil, fmt.Errorf("parse backend overlay response: %w", err)
-	}
-	return parsed, nil
-}
-
-// applyOverlayToScaffold writes the changed files returned by the backend into the scaffoldDir
-// and merges newDependencies into scaffoldDir/package.json as dependency placeholders ("*").
-// It returns a list of written files and any warning errors encountered.
-func applyOverlayToScaffold(scaffoldDir string, changedFiles []map[string]interface{}, newDependencies []string) ([]string, error) {
-	written := []string{}
-	// write changed files (overwrite or create)
-	for _, f := range changedFiles {
-		pathIface, ok := f["path"]
-		if !ok {
-			continue
-		}
-		contentIface, _ := f["content"]
-		pathStr, ok := pathIface.(string)
-		if !ok || strings.TrimSpace(pathStr) == "" {
-			continue
-		}
-		contentStr, _ := contentIface.(string)
-		target := filepath.Join(scaffoldDir, filepath.FromSlash(pathStr))
-
-		if err := os.WriteFile(target, []byte(contentStr), 0o644); err != nil {
-			return written, fmt.Errorf("write file %s: %w", target, err)
-		}
-		written = append(written, pathStr)
-	}
-
-	// merge dependencies into package.json using "*" placeholder
-	pkgPath := filepath.Join(scaffoldDir, "package.json")
-	pkgBytes, err := os.ReadFile(pkgPath)
-	if err != nil {
-		// If package.json missing, still return the written files and warn
-		if len(newDependencies) > 0 {
-			return written, fmt.Errorf("package.json not found in scaffold; cannot merge dependencies")
-		}
-		return written, nil
-	}
-	var pj map[string]interface{}
-	if err := json.Unmarshal(pkgBytes, &pj); err != nil {
-		return written, fmt.Errorf("invalid package.json: %w", err)
-	}
-	// Ensure dependencies map exists
-	deps, ok := pj["dependencies"].(map[string]interface{})
-	if !ok || deps == nil {
-		deps = map[string]interface{}{}
-	}
-	for _, d := range newDependencies {
-		if d == "" {
-			continue
-		}
-		if _, exists := deps[d]; !exists {
-			deps[d] = "*" // placeholder; pin locally later with resolver
-		}
-	}
-	pj["dependencies"] = deps
-	// write back package.json
-	updated, err := json.MarshalIndent(pj, "", "  ")
-	if err != nil {
-		return written, fmt.Errorf("marshal updated package.json: %w", err)
-	}
-	if err := os.WriteFile(pkgPath, updated, 0o644); err != nil {
-		return written, fmt.Errorf("write package.json: %w", err)
-	}
-
-	// NOTE: pinning to exact versions should be done after this step using your dep_resolver
-	// (e.g., call resolve_with_npm_lockfile_fully or run npm install --package-lock-only)
-	return written, nil
 }
 
 func exists(path string) bool {

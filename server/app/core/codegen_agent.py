@@ -155,6 +155,7 @@ async def stream_generate_project(payload: Dict[str, Any]) -> AsyncGenerator[str
     # build base_files_map if provided in payload
     base_files_map = {}
     normalized_assets = set()
+    print(payload)
     if isinstance(payload.get("asset_files"), list):
         for a in payload.get("asset_files", []):
             na = _safe_normalize(a) if callable(globals().get("_safe_normalize", None)) else None
@@ -526,11 +527,15 @@ def _build_overlay_user_prompt(
             snippet = (c or "")[:800].replace("\n", "\\n")
             manifest.append({"path": p, "snippet": snippet})
 
+            
+    folder_tree_str = build_folder_tree(base_files_map)
+
     prompt = (
         "Context:\n"
         f"User requirements:\n{user_json}\n\n"
         "Existing scaffold manifest (path + snippet):\n"
         f"{json.dumps(manifest, ensure_ascii=False)}\n\n"
+        f"Existing folder structure:{folder_tree_str}\n"
         "Task:\n"
         "- The project scaffold already exists (paths in the manifest). DO NOT regenerate the whole project.\n"
         "- Return ONLY files you need to ADD or CHANGE to implement the user's requests.\n"
@@ -538,8 +543,9 @@ def _build_overlay_user_prompt(
         "- For changed files, return the full file content (not a diff). For new files, return full content.\n"
         "- Keep changes minimal and avoid reformatting or renaming files unless required.\n\n"
         "- Follow the file format: e.g., if it's a Next.js project mainly using JavaScript, use JS format for new components, not TSX.\n"
+        "- Use styling provided in project scaffold. example, tailwind\n"
+        "- Modify readme or any kind of title tags so it best describes what project user is building"
         "- Do not add another Storyblok package.\n"
-        "- Do NOT return binary assets; reference their paths only.\n"
         "Output: produce a single JSON object with keys: project_name (optional), files (array of {path,content}), new_dependencies (array of package NAMES), warnings (optional).\n"
         "Return only JSON and nothing else.\n"
     )
@@ -592,3 +598,21 @@ def _log_raw_llm_output(tag: str, data: Any, debug: bool = False):
                 f.write(str(data))
     except Exception as e:
         print(f"[debug-log-failed] {e}")
+
+
+def build_folder_tree(base_files_map: Dict[str, str]) -> str:
+    tree = {}
+    for path in base_files_map.keys():
+        parts = path.split("/")
+        d = tree
+        for p in parts[:-1]:
+            d = d.setdefault(p, {})
+        d[parts[-1]] = None  # file
+    def render(d, prefix=""):
+        lines = []
+        for k, v in d.items():
+            lines.append(prefix + k + ("/" if isinstance(v, dict) else ""))
+            if isinstance(v, dict):
+                lines += render(v, prefix + "  ")
+        return lines
+    return "\n".join(render(tree))
