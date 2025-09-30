@@ -573,6 +573,22 @@ func runCreateWizard(cmd *cobra.Command) error {
 		if err != nil {
 			// fallback to non-streaming behavior (older backend)
 			respMap, err2 := callBackendWithSpinner(backendURL, payload, "Generating project (fallback) — please wait...")
+			// attempt to print any new_dependencies from metadata
+			if md, ok := respMap["metadata"].(map[string]interface{}); ok {
+				if deps, ok := md["dependencies"].(map[string]interface{}); ok {
+					if ndRaw, ok := deps["new_dependencies"]; ok {
+						if ndArr, ok := ndRaw.([]interface{}); ok && len(ndArr) > 0 {
+							fmt.Println("\nSuggested new dependencies:")
+							for _, d := range ndArr {
+								if s, ok := d.(string); ok {
+									fmt.Printf("  - %s\n", s)
+								}
+							}
+						}
+					}
+				}
+			}
+
 			if err2 != nil {
 				return fmt.Errorf("call backend (stream failed, fallback failed): %v / %v", err, err2)
 			}
@@ -775,21 +791,35 @@ func runCreateWizard(cmd *cobra.Command) error {
 					f.Close()
 				}
 				_ = final // nothing now
-			case "dependency":
-				if m, ok := payloadEv.(map[string]interface{}); ok {
-					name, _ := m["name"].(string)
-					version, _ := m["version"].(string)
-					conf, _ := m["confidence"].(float64)
-					if version != "" {
-						fmt.Printf("Resolved: %s@%s (confidence %.2f)\n", name, version, conf)
-					} else {
-						// print candidate summary if available
-						if cands, ok := m["candidates"].([]interface{}); ok && len(cands) > 0 {
-							fmt.Printf("Dependency not found: %s — suggested: %v\n", name, cands)
-						} else {
-							fmt.Printf("Dependency not found: %s\n", name)
+			case "new_dependencies":
+				// payloadEv may be []interface{} or other structured data from JSON
+				if arr, ok := payloadEv.([]interface{}); ok {
+					if len(arr) > 0 {
+						fmt.Println("\nSuggested new dependencies from model:")
+						for _, it := range arr {
+							if s, ok := it.(string); ok {
+								fmt.Printf("  - %s\n", s)
+							} else {
+								bs, _ := json.Marshal(it)
+								fmt.Printf("  - %s\n", string(bs))
+							}
+						}
+
+						// Optional: write a timestamped log file for debugging / audit
+						if logDirErr := os.MkdirAll("ai_backend_logs", 0o755); logDirErr == nil {
+							if b, err := json.MarshalIndent(arr, "", "  "); err == nil {
+								fname := fmt.Sprintf("ai_backend_logs/%d_new_dependencies.json", time.Now().Unix())
+								_ = os.WriteFile(fname, b, 0o644)
+							}
 						}
 					}
+				} else {
+					// fallback generic print + log
+					bs, _ := json.MarshalIndent(payloadEv, "", "  ")
+					fmt.Printf("\nnew_dependencies: %s\n", string(bs))
+					_ = os.MkdirAll("ai_backend_logs", 0o755)
+					fname := fmt.Sprintf("ai_backend_logs/%d_new_dependencies_misc.json", time.Now().Unix())
+					_ = os.WriteFile(fname, bs, 0o644)
 				}
 
 			case "file_complete":

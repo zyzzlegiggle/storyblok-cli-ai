@@ -194,12 +194,32 @@ async def stream_generate_project(payload: Dict[str, Any]) -> AsyncGenerator[str
         # emit new_dependencies event so CLI can print/apply them
         if base_files_map:
             nd = parsed.get("new_dependencies") or parsed.get("metadata", {}).get("new_dependencies")
-            if isinstance(nd, list) and nd:
-                try:
-                    yield await _yield_event("new_dependencies", nd)
-                except Exception:
-                    pass
+            if isinstance(nd, list):
+                dep_list = [d for d in nd if isinstance(d, str)]
+                # record compactly in metadata for later usage
+                merged_warnings.extend(parsed.get("metadata", {}).get("warnings", []) or [])
+                # stash dep meta for the response
+                dep_meta_for_resp = {"new_dependencies": dep_list}
+                # attach into parsed metadata so outer code can pick it up
+                parsed.setdefault("metadata", {}).setdefault("dependencies", {}).update(dep_meta_for_resp)
 
+                # --- NEW: also ensure final resp.metadata will include these new_dependencies ---
+                # we'll merge it into the metadata dict that will be returned below
+                metadata_dependencies = metadata.get("dependencies", {}) if 'metadata' in locals() else {}
+                metadata_dependencies.update(dep_meta_for_resp)
+                # ensure metadata exists in locals for later
+                if 'metadata' in locals():
+                    metadata.setdefault("dependencies", {}).update(dep_meta_for_resp)
+                else:
+                    # create metadata early so later resp contains dependencies
+                    metadata = {"generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                "warnings": merged_warnings,
+                                "validation": validation_report,
+                                "dependencies": dep_meta_for_resp}
+
+        parsed_deps = parsed.get("metadata", {}).get("dependencies", {}) if isinstance(parsed, dict) else {}
+        if parsed_deps:
+            metadata.setdefault("dependencies", {}).update(parsed_deps)
         if parsed.get("metadata", {}).get("warnings"):
             for w in parsed.get("metadata", {}).get("warnings"):
                 yield await _yield_event("warning", w)
