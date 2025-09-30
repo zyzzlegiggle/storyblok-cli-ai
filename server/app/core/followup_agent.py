@@ -155,25 +155,7 @@ async def generate_followup_questions(payload: Dict[str, Any]) -> Dict[str, Any]
         min_urgency = 0.25
     filtered = [f for f in filtered if float(f.get("urgency", 0.5)) >= min_urgency]
 
-    # 5) Pad with safe default questions if needed (backwards compat)
-    pad_allowed = bool(options.get("pad", True))
-    if len(filtered) < max_questions and pad_allowed:
-        pads = [
-            "Which pages should the app include (e.g., home, about, blog, contact)?",
-            "List the core features required (search, auth, forms, ecommerce, CMS editing).",
-            "Do you want user authentication? If yes, what type (email, OAuth, SSO)?",
-            "Describe the visual style briefly (minimal, corporate, colorful, design system).",
-            "What is the target audience?"
-        ]
-        for p in pads:
-            if len(filtered) >= max_questions:
-                break
-            pn = _normalize(p)
-            if pn not in seen_qs:
-                filtered.append({"id": "", "question": p, "urgency": 0.4})
-                seen_qs.add(pn)
-
-    # 6) Truncate to desired count
+    # 5) Truncate to desired count
     out = filtered[:max_questions]
 
     # Return the final followups list (structured)

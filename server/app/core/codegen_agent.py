@@ -7,7 +7,6 @@ Code Generation Agent
 - Intended to be the single responsibility module that performs:
     - LLM orchestration for chunked component generation + scaffold
     - Dependency collection + pinning (curated map + npm registry)
-    - Optional TypeScript validation + bounded repair loop
     - Sanitization & deduplication of emitted files
     - Streaming-safe emission helpers (file_start/file_chunk/file_complete)
 """
@@ -28,6 +27,7 @@ from core.prompts import build_system_prompt, build_user_prompt, summarize_schem
 from core.dep_resolver import resolve_and_pin_files
 from core.validator import run_validations, attempt_repair
 from core.followup_agent import generate_followup_questions  # localized import
+from utils.file_helpers import _safe_normalize
 from utils.config import AGENT_TEMPERATURES
 
 # configuration
@@ -164,13 +164,25 @@ async def stream_generate_project(payload: Dict[str, Any]) -> AsyncGenerator[str
     if not components:
         # build base_files_map if provided in payload
         base_files_map = {}
+        normalized_assets = set()
+        if isinstance(payload.get("asset_files"), list):
+            for a in payload.get("asset_files", []):
+                na = _safe_normalize(a) if callable(globals().get("_safe_normalize", None)) else None
+                if na:
+                    normalized_assets.add(na)
         if isinstance(payload.get("base_files"), list):
             for bf in payload.get("base_files", []):
                 if isinstance(bf, dict):
                     p = bf.get("path") or ""
-                    c = bf.get("content") or ""
+                    # skip if path is provided as asset
                     np = _normalize_path(p)
+                    if np in normalized_assets:
+                        # explicitly treat as asset: set empty content or skip entirely
+                        base_files_map[np] = ""  # indicate asset placeholder
+                        continue
+                    c = bf.get("content") or ""
                     base_files_map[np] = c
+
 
         if base_files_map:
             overlay_user_prompt = _build_overlay_user_prompt(user_for_prompt, schema, options, base_files_map)
@@ -276,8 +288,6 @@ async def stream_generate_project(payload: Dict[str, Any]) -> AsyncGenerator[str
             except Exception:
                 pass
 
-            # optional TypeScript validation
-            # optional TypeScript validation using validator agent (with bounded repair)
             try:
                 validate = bool(options.get("validate", False))
                 if validate:
@@ -543,9 +553,16 @@ def _normalize_path(p: str) -> str:
     # make paths consistent for comparison
     return os.path.normpath(p).replace("\\", "/").lstrip("/")
 
-def _build_overlay_user_prompt(user_for_prompt: Dict[str, Any], schema: Dict[str, Any], options: Dict[str, Any], base_files_map: Dict[str, str]) -> str:
+def _build_overlay_user_prompt(
+    user_for_prompt: Dict[str, Any],
+    schema: Dict[str, Any],
+    options: Dict[str, Any],
+    base_files_map: Dict[str, str],
+    asset_files: Optional[List[str]] = None  # optional list of asset paths
+) -> str:
     """
     Build a user prompt that instructs the LLM to act as an overlay when base_files_map is provided.
+    Includes asset placeholders so the LLM knows these exist but does not get their contents.
     """
     schema_summary = summarize_schema(schema)
     try:
@@ -553,11 +570,16 @@ def _build_overlay_user_prompt(user_for_prompt: Dict[str, Any], schema: Dict[str
     except Exception:
         user_json = str(user_for_prompt)
 
+    normalized_assets = set(asset_files or [])
+
     # small manifest: path + snippet (first ~600 chars) for context
     manifest = []
     for p, c in list(base_files_map.items())[:200]:
-        snippet = (c or "")[:600].replace("\n", "\\n")
-        manifest.append({"path": p, "snippet": snippet})
+        if p in normalized_assets:
+            manifest.append({"path": p, "asset": True})
+        else:
+            snippet = (c or "")[:800].replace("\n", "\\n")
+            manifest.append({"path": p, "snippet": snippet})
 
     prompt = (
         "Context:\n"
@@ -571,8 +593,9 @@ def _build_overlay_user_prompt(user_for_prompt: Dict[str, Any], schema: Dict[str
         "- Do NOT modify 'package.json'. Instead, list any additional NPM packages (NAMES ONLY) in 'new_dependencies'.\n"
         "- For changed files, return the full file content (not a diff). For new files, return full content.\n"
         "- Keep changes minimal and avoid reformatting or renaming files unless required.\n\n"
-        "-Follow the file format, example, if its nextjs project, mainly using javascript files, then if you add components, use in javascript format, not in tsx.\n"
-        "-Do not add another storyblok packages\n"
+        "- Follow the file format: e.g., if it's a Next.js project mainly using JavaScript, use JS format for new components, not TSX.\n"
+        "- Do not add another Storyblok package.\n"
+        "- Do NOT return binary assets; reference their paths only.\n"
         "Output: produce a single JSON object with keys: project_name (optional), files (array of {path,content}), new_dependencies (array of package NAMES), warnings (optional).\n"
         "Return only JSON and nothing else.\n"
     )

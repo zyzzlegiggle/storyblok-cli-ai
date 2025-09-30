@@ -337,7 +337,7 @@ func runCreateWizard(cmd *cobra.Command) error {
 		return fmt.Errorf("target directory already exists: %s (remove or choose another name)", absTarget)
 	}
 
-	_, baseFiles, err := runStoryblokCreateAndCollect(chosenFramework, absTarget, token, chosenPM, chosenRegion)
+	_, baseFiles, assetFiles, err := runStoryblokCreateAndCollect(chosenFramework, absTarget, token, chosenPM, chosenRegion)
 	if err != nil {
 		// If the CLI failed and we didn't have the target before, cleanup the partially created dir
 		if !preExists {
@@ -356,7 +356,8 @@ func runCreateWizard(cmd *cobra.Command) error {
 			"region":         chosenRegion,
 			"debug":          payload["options"].(map[string]interface{})["debug"],
 		},
-		"base_files": baseFiles, // will be marshaled as JSON array of {path,content}
+		"base_files":  baseFiles,  // will be marshaled as JSON array of {path,content}
+		"asset_files": assetFiles, // list of binary asset paths (no bytes)
 	}
 
 	if b, err := json.MarshalIndent(payload, "", "  "); err == nil {
@@ -997,9 +998,9 @@ func stableIDForQuestion(round int, index int, question string) string {
 var allowedFrameworks = []string{"astro", "react", "nextjs", "sveltekit", "vue", "nuxt"}
 
 // runStoryblokCreateAndCollect runs the Storyblok create-demo CLI into `targetDir` and
-// returns the absolute path and a list of scaffold.FileOut (excluding package.json & lockfiles).
-// targetDir should be a path (can be a temp dir or a real path). It will be created if missing.
-func runStoryblokCreateAndCollect(framework, targetDir, token, packagemanager, region string) (string, []scaffold.FileOut, error) {
+// returns the absolute path, a list of scaffold.FileOut (excluding package.json & lockfiles),
+// AND a list of asset file paths (binary files that were not inlined). targetDir will be created if missing.
+func runStoryblokCreateAndCollect(framework, targetDir, token, packagemanager, region string) (string, []scaffold.FileOut, []string, error) {
 
 	// build npx args. Use --yes to avoid prompts when possible.
 	args := []string{"--yes", "@storyblok/create-demo@latest", "-d", targetDir, "-f", framework}
@@ -1019,18 +1020,30 @@ func runStoryblokCreateAndCollect(framework, targetDir, token, packagemanager, r
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
-		return "", nil, fmt.Errorf("running storyblok create failed: %w", err)
+		return "", nil, nil, fmt.Errorf("running storyblok create failed: %w", err)
+	}
+
+	// define binary extensions we treat as assets (same set used elsewhere)
+	binaryExts := map[string]struct{}{
+		".png":  {},
+		".jpg":  {},
+		".jpeg": {},
+		".gif":  {},
+		".svg":  {},
+		".ico":  {},
+		".webp": {},
+		".avif": {},
 	}
 
 	// Walk the generated folder and collect files, excluding package.json and lockfiles and node_modules/.git
 	collected := []scaffold.FileOut{}
+	assets := []string{}
 	err := filepath.WalkDir(targetDir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			// ignore problematic files but continue
 			return nil
 		}
 		rel, _ := filepath.Rel(targetDir, path)
-
 		rel = filepath.ToSlash(rel)
 		// Skip directories we don't want to descend into
 		if d.IsDir() {
@@ -1048,7 +1061,17 @@ func runStoryblokCreateAndCollect(framework, targetDir, token, packagemanager, r
 		if base == "package.json" || base == "package-lock.json" || base == "yarn.lock" || base == "pnpm-lock.yaml" {
 			return nil
 		}
-		// read file
+
+		ext := strings.ToLower(filepath.Ext(rel))
+		if _, isBinary := binaryExts[ext]; isBinary {
+			// mark as asset (do NOT read bytes)
+			assets = append(assets, rel)
+			// keep a FileOut entry with empty content so callers can see the path
+			collected = append(collected, scaffold.FileOut{Path: rel, Content: ""})
+			return nil
+		}
+
+		// read file (text)
 		b, rerr := os.ReadFile(path)
 		if rerr != nil {
 			// ignore read errors
@@ -1059,10 +1082,10 @@ func runStoryblokCreateAndCollect(framework, targetDir, token, packagemanager, r
 	})
 	if err != nil {
 		// non-fatal: return what we collected and the error
-		return targetDir, collected, fmt.Errorf("walking generated dir: %w", err)
+		return targetDir, collected, assets, fmt.Errorf("walking generated dir: %w", err)
 	}
 
-	return targetDir, collected, nil
+	return targetDir, collected, assets, nil
 }
 
 // callOverlayBackend posts the base scaffold to the backend overlay endpoint and returns parsed JSON.

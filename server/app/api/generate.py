@@ -14,6 +14,7 @@ import tempfile
 from pathlib import Path
 import shutil
 
+from utils.file_helpers import _safe_normalize
 from pydantic import BaseModel as PydanticBaseModel
 
 router = APIRouter()
@@ -22,6 +23,9 @@ class GenerateRequest(BaseModel):
     user_answers: Dict[str, Any]
     storyblok_schema: Dict[str, Any]
     options: Optional[Dict[str, Any]] = {}
+    base_files: Optional[List[Dict[str, Any]]] = None
+    asset_files: Optional[List[str]] = None
+
 
 @router.post("/", response_model=Dict[str, Any])
 async def generate(req: GenerateRequest):
@@ -65,21 +69,7 @@ async def generate_questions(req: GenerateRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- Helper: safe path normalize & reject traversal/abs paths ---
-def _safe_normalize(p: str) -> Optional[str]:
-    if not isinstance(p, str) or p.strip() == "":
-        return None
-    p = p.replace("\\", "/")
-    # disallow absolute paths
-    if os.path.isabs(p):
-        return None
-    # clean
-    clean = os.path.normpath(p)
-    # normalized might contain backslashes on windows; use forward slashes in returned path
-    if clean.startswith("..") or "/.." in clean or clean == "..":
-        return None
-    # ensure relative and use forward slashes
-    return clean.replace("\\", "/").lstrip("./")
+
 
 class FileOutModel(PydanticBaseModel):
     path: str
@@ -115,15 +105,28 @@ async def generate_overlay(request: Dict[str, Any]):
         user_answers = request.get("user_answers", {}) or {}
         schema = request.get("storyblok_schema", {}) or {}
         options = request.get("options", {}) or {}
+# --- inside generate_overlay(...) near the top after reading request dict ---
         base_files = request.get("base_files", []) or []
+        asset_files = request.get("asset_files", []) or []  # NEW: list of relative paths (strings)
         _log_incoming_request("overlay", request)
         # validate base_files shape
         if not isinstance(base_files, list):
             raise HTTPException(status_code=400, detail="base_files must be an array of {path,content}")
+        if not isinstance(asset_files, list):
+            raise HTTPException(status_code=400, detail="asset_files must be an array of file path strings")
 
         # create temp workspace and write base files (skip package.json if present)
         tmpdir = tempfile.mkdtemp(prefix="overlay_ws_")
         try:
+            # normalize and validate asset list
+            normalized_assets = set()
+            for a in asset_files:
+                if not isinstance(a, str):
+                    continue
+                sp = _safe_normalize(a)
+                if sp:
+                    normalized_assets.add(sp)
+
             base_map: Dict[str,str] = {}
             for f in base_files:
                 if not isinstance(f, dict):
@@ -134,13 +137,21 @@ async def generate_overlay(request: Dict[str, Any]):
                 if sp is None:
                     # skip unsafe or empty paths
                     continue
+                # never write assets to workspace: if path is listed as asset, skip writing content
+                if sp in normalized_assets:
+                    # record but do not write binary content to disk
+                    base_map[sp] = ""  # indicate presence but no content
+                    continue
+
                 # skip package.json intentionally
                 if os.path.basename(sp) == "package.json":
                     continue
                 target = Path(tmpdir) / sp
                 target.parent.mkdir(parents=True, exist_ok=True)
+                # write text content (safe, empty content allowed for placeholders)
                 target.write_text(c or "", encoding="utf-8")
                 base_map[sp] = c or ""
+
 
             # Build overlay-specific system + user prompt
             schema_summary = summarize_schema(schema)
@@ -195,14 +206,17 @@ async def generate_overlay(request: Dict[str, Any]):
             # Extract files (list of {path,content})
             files_out_raw = parsed.get("files", []) or []
             candidate_files: List[Dict[str,str]] = []
+            binary_exts = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".avif"}
             for it in files_out_raw:
                 if not isinstance(it, dict):
                     continue
                 p = it.get("path") or ""
                 c = it.get("content") or ""
                 sp = _safe_normalize(p)
-                if sp is None:
-                    # skip unsafe paths
+                if sp is None: continue
+                if os.path.splitext(sp)[1].lower() in binary_exts:
+                    # warn and skip binary files returned by model
+                    warnings.append(f"model attempted to return binary asset as text: {sp}; skipped")
                     continue
                 # never accept package.json modifications
                 if os.path.basename(sp) == "package.json":
