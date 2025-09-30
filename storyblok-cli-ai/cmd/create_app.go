@@ -214,6 +214,39 @@ func readJSONLine(r *bufio.Reader) ([]byte, error) {
 // ---------------- Main wizard ----------------
 
 func runCreateWizard(cmd *cobra.Command) error {
+	runPackageInstall := func(pm string, projectDir string) error {
+		// Choose command based on package manager
+		cmdName := "npm"
+		args := []string{"install"}
+		if strings.ToLower(strings.TrimSpace(pm)) == "yarn" {
+			cmdName = "yarn"
+			args = []string{"install"}
+		}
+
+		// Inform user
+		fmt.Printf("\nRunning `%s %s` in %s — this may take a while...\n\n", cmdName, strings.Join(args, " "), projectDir)
+
+		cmd := exec.Command(cmdName, args...)
+		cmd.Dir = projectDir
+		// Stream command output so user sees progress/errors
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		if err := cmd.Run(); err != nil {
+			fmt.Printf("\nInstallation with %s failed: %v\n", cmdName, err)
+			fmt.Println("You can try to install dependencies manually by running:")
+			if cmdName == "yarn" {
+				fmt.Printf("  cd %s && yarn install\n", projectDir)
+			} else {
+				fmt.Printf("  cd %s && npm install\n", projectDir)
+			}
+			return err
+		}
+
+		fmt.Printf("\nDependency installation finished successfully with %s.\n", cmdName)
+		return nil
+	}
+
 	// helper: start an indeterminate progress spinner; returns a channel you should close to stop it
 	// helper: start an indeterminate progress spinner; returns a channel you should close to stop it
 	startSpinner := func(desc string) chan struct{} {
@@ -587,6 +620,30 @@ func runCreateWizard(cmd *cobra.Command) error {
 						}
 					}
 				}
+
+				if ufRaw, ok2 := md["unused_files"]; ok2 {
+					if arr, ok3 := ufRaw.([]interface{}); ok3 {
+						if len(arr) > 0 {
+							fmt.Println("\nRemoving unused scaffold files suggested by backend:")
+							for _, it := range arr {
+								if s, ok4 := it.(string); ok4 {
+									target := filepath.Join(absTarget, s)
+									tclean, _ := filepath.Abs(target)
+									if strings.HasPrefix(tclean, absTarget) {
+										err := os.RemoveAll(tclean)
+										if err != nil {
+											fmt.Printf("  - failed to remove %s: %v\n", s, err)
+										} else {
+											fmt.Printf("  - removed %s\n", s)
+										}
+									} else {
+										fmt.Printf("  - skipping suspicious path (outside target): %s\n", s)
+									}
+								}
+							}
+						}
+					}
+				}
 			}
 
 			if err2 != nil {
@@ -610,6 +667,10 @@ func runCreateWizard(cmd *cobra.Command) error {
 				files := parseFilesFromResponse(respMap)
 				if len(files) == 0 {
 					return fmt.Errorf("backend returned no files and no followups")
+				}
+				if err := runPackageInstall(chosenPM, absTarget); err != nil {
+					// Installation failed: we still succeed creating the project, but surface the error
+					fmt.Println("\n⚠️  Dependency installation failed — project was created but dependencies may be missing.")
 				}
 				fmt.Println("Project created successfully at:", absTarget)
 				fmt.Println("\n⚠️  Security note:")
@@ -727,7 +788,7 @@ func runCreateWizard(cmd *cobra.Command) error {
 
 			return true, nil
 		}
-
+		unusedPaths := []string{}
 		// read loop
 		for {
 			lineBytes, err := readJSONLine(reader)
@@ -821,6 +882,31 @@ func runCreateWizard(cmd *cobra.Command) error {
 					fname := fmt.Sprintf("ai_backend_logs/%d_new_dependencies_misc.json", time.Now().Unix())
 					_ = os.WriteFile(fname, bs, 0o644)
 				}
+			case "unused_file":
+				if m, ok := payloadEv.(map[string]interface{}); ok {
+					if p, ok2 := m["path"].(string); ok2 && p != "" {
+						// normalize path relative to project root
+						unusedPaths = append(unusedPaths, p)
+						fmt.Printf("DEBUG: backend marked unused file: %s\n", p)
+					}
+				} else if s, ok := payloadEv.(string); ok {
+					unusedPaths = append(unusedPaths, s)
+					fmt.Printf("DEBUG: backend marked unused file: %s\n", s)
+				}
+			case "unused_files":
+				// payload may be array of strings
+				if arr, ok := payloadEv.([]interface{}); ok {
+					for _, it := range arr {
+						if s, ok2 := it.(string); ok2 {
+							unusedPaths = append(unusedPaths, s)
+							fmt.Printf("DEBUG: backend marked unused file: %s\n", s)
+						}
+					}
+				} else {
+					// fallback print
+					bs, _ := json.Marshal(payloadEv)
+					fmt.Printf("DEBUG unused_files payload: %s\n", string(bs))
+				}
 
 			case "file_complete":
 				m, _ := payloadEv.(map[string]interface{})
@@ -902,6 +988,33 @@ func runCreateWizard(cmd *cobra.Command) error {
 			return fmt.Errorf("writing files to project dir: %w", err)
 		}
 		fmt.Println("Project created successfully at:", absTarget)
+
+		// After writing files and before printing success or right after:
+		if len(unusedPaths) > 0 {
+			fmt.Println("\nRemoving unused scaffold files suggested by backend:")
+			for _, up := range unusedPaths {
+				// ensure path is within project dir for safety
+				target := filepath.Join(absTarget, up)
+				// normalize
+				tclean, _ := filepath.Abs(target)
+				if strings.HasPrefix(tclean, absTarget) {
+					err := os.RemoveAll(tclean)
+					if err != nil {
+						fmt.Printf("  - failed to remove %s: %v\n", up, err)
+					} else {
+						fmt.Printf("  - removed %s\n", up)
+					}
+				} else {
+					fmt.Printf("  - skipping suspicious path (outside target): %s\n", up)
+				}
+			}
+		}
+
+		// Attempt to install dependencies using chosen package manager
+		if err := runPackageInstall(chosenPM, absTarget); err != nil {
+			// Installation failed: we still succeed creating the project, but surface the error
+			fmt.Println("\n⚠️  Dependency installation failed — project was created but dependencies may be missing.")
+		}
 
 		fmt.Println("\n⚠️  Security note:")
 		fmt.Println("  - A .env file containing your Storyblok token may have been written to the project root.")
