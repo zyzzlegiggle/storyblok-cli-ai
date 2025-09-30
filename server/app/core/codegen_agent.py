@@ -26,7 +26,7 @@ from core.llm_client import call_structured_generation, GenerateResponseModel
 from core.prompts import build_system_prompt, build_user_prompt
 from core.dep_resolver import resolve_and_pin_files
 from core.validator import run_validations, attempt_repair
-from core.followup_agent import generate_followup_questions  # localized import
+from core.followup_agent import generate_followup_questions, _parse_followups  # localized import
 from utils.file_helpers import _safe_normalize
 from utils.config import AGENT_TEMPERATURES
 
@@ -183,6 +183,9 @@ async def stream_generate_project(payload: Dict[str, Any]) -> AsyncGenerator[str
 
         parsed = await call_structured_generation(full_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
         parsed = _ensure_parsed_dict("full_gen", parsed)
+        # ensure metadata.followups is a list of dicts
+        if "metadata" in parsed and "followups" in parsed["metadata"]:
+            parsed["metadata"]["followups"] = _parse_followups(parsed["metadata"]["followups"])
         files = parsed.get("files", []) or []
         if base_files_map:
             files = _compute_delta_files(files, base_files_map)
@@ -365,6 +368,9 @@ async def generate_project(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     parsed = await call_structured_generation(full_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
     parsed = _ensure_parsed_dict("full_gen", parsed)
+    # ensure metadata.followups is a list of dicts
+    if "metadata" in parsed and "followups" in parsed["metadata"]:
+        parsed["metadata"]["followups"] = _parse_followups(parsed["metadata"]["followups"])
     _log_raw_llm_output("generate_project_full", parsed, debug)
 
     files = parsed.get("files", []) or []
@@ -544,7 +550,8 @@ def _build_overlay_user_prompt(
         "- Keep changes minimal and avoid reformatting or renaming files unless required.\n\n"
         "- Follow the file format: e.g., if it's a Next.js project mainly using JavaScript, use JS format for new components, not TSX.\n"
         "- Use styling provided in project scaffold. example, tailwind\n"
-        "- Modify readme or any kind of title tags so it best describes what project user is building"
+        "- Modify readme is allowed\n"
+        "-Ensure page routing is possible"
         "- Do not add another Storyblok package.\n"
         "Output: produce a single JSON object with keys: project_name (optional), files (array of {path,content}), new_dependencies (array of package NAMES), warnings (optional).\n"
         "Return only JSON and nothing else.\n"
