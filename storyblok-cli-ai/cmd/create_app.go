@@ -214,6 +214,49 @@ func readJSONLine(r *bufio.Reader) ([]byte, error) {
 // ---------------- Main wizard ----------------
 
 func runCreateWizard(cmd *cobra.Command) error {
+	// helper: start an indeterminate progress spinner; returns a channel you should close to stop it
+	// helper: start an indeterminate progress spinner; returns a channel you should close to stop it
+	startSpinner := func(desc string) chan struct{} {
+		done := make(chan struct{})
+		pb := progressbar.NewOptions(-1,
+			progressbar.OptionSetDescription(desc),
+			progressbar.OptionShowCount(),
+			progressbar.OptionSpinnerType(14),
+		)
+		go func() {
+			ticker := time.NewTicker(120 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					_ = pb.Finish()
+					return
+				case <-ticker.C:
+					_ = pb.Add(1)
+				}
+			}
+		}()
+		return done
+	}
+	// wrapper for callBackend that shows a spinner while waiting
+
+	// wrapper for callBackend that shows a spinner while waiting
+	callBackendWithSpinner := func(url string, payload map[string]interface{}, spinnerDesc string) (map[string]interface{}, error) {
+		done := startSpinner(spinnerDesc)
+		resp, err := callBackend(url, payload)
+		close(done)
+		return resp, err
+	}
+
+	// wrapper for callBackendStream that shows a spinner while waiting for the initial response
+	// wrapper for callBackendStream that shows a spinner while waiting for the initial response
+	callBackendStreamWithSpinner := func(url string, payload map[string]interface{}, spinnerDesc string) (*http.Response, error) {
+		done := startSpinner(spinnerDesc)
+		resp, err := callBackendStream(url, payload)
+		// Stop spinner as soon as we have the response (we will handle the streaming read separately).
+		close(done)
+		return resp, err
+	}
 	// 1) Single freeform prompt + token prompt
 	var description string
 	var token string
@@ -227,8 +270,8 @@ func runCreateWizard(cmd *cobra.Command) error {
 	description = strings.TrimSpace(description)
 
 	if err := survey.AskOne(&survey.Input{
-		Message: "Storyblok API token (optional, will be written to .env if provided):",
-	}, &token); err != nil {
+		Message: "Storyblok API token:",
+	}, &token, survey.WithValidator(survey.Required)); err != nil {
 		return fmt.Errorf("token prompt aborted: %w", err)
 	}
 	token = strings.TrimSpace(token)
@@ -378,7 +421,8 @@ func runCreateWizard(cmd *cobra.Command) error {
 			},
 		}
 
-		qResp, err := callBackend(backendURL+"questions", qPayload)
+		// Use spinner-wrapped backend call so user sees loading after answering follow-ups
+		qResp, err := callBackendWithSpinner(backendURL+"questions", qPayload, "Analyzing answers — generating follow-ups...")
 		respBytes, _ := json.MarshalIndent(qResp, "", "  ")
 		fmt.Println("DEBUG backend response:\n", string(respBytes))
 		if err != nil {
@@ -524,10 +568,11 @@ func runCreateWizard(cmd *cobra.Command) error {
 	for round := 1; round < maxRounds; round++ {
 		currentRound = round
 		// call streaming endpoint to get progress + files
-		resp, err := callBackendStream(backendStreamURL, payload)
+		// show spinner while waiting for the streaming endpoint to accept the request
+		resp, err := callBackendStreamWithSpinner(backendStreamURL, payload, "Generating project — this may take a minute...")
 		if err != nil {
 			// fallback to non-streaming behavior (older backend)
-			respMap, err2 := callBackend(backendURL, payload)
+			respMap, err2 := callBackendWithSpinner(backendURL, payload, "Generating project (fallback) — please wait...")
 			if err2 != nil {
 				return fmt.Errorf("call backend (stream failed, fallback failed): %v / %v", err, err2)
 			}
