@@ -33,26 +33,6 @@ It uses **FastAPI**, **LangChain**, and **Google Gemini** to generate project co
 
 ---
 
-## 📂 Project Structure
-
-```
-ai_server_demo/
-│
-├── app/
-│   ├── core/
-│   │   ├── followup_agent.py   # follow-up question generator
-│   │   ├── llm_client.py       # Gemini client (LangChain wrapper)
-│   │   ├── prompts.py          # system & user prompts
-│   │
-│   ├── main.py                 # FastAPI entrypoint
-│   └── ...
-│
-├── requirements.txt
-└── README.md
-```
-
----
-
 ## ⚙️ Setup
 
 ### 1. Clone the repo
