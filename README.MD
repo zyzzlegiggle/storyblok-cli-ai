@@ -31,30 +31,6 @@ This project consists of two main components:
 
 ---
 
-## 📂 Project Structure
-
-```
-storyblok-cli-ai/
-│
-├── cli/                   # Go CLI
-│   ├── main.go
-│   ├── cmd/
-│   │   ├── root.go
-│   │   └── create_app.go
-│   └── internal/scaffold/
-│
-└── server/                # FastAPI backend
-    ├── app/
-    │   ├── core/
-    │   │   ├── followup_agent.py
-    │   │   ├── llm_client.py
-    │   │   └── prompts.py
-    │   └── main.py
-    └── requirements.txt
-```
-
----
-
 ## ⚙️ Setup
 
 ### Prerequisites
