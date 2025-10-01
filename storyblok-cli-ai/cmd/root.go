@@ -9,8 +9,8 @@ import (
 
 var rootCmd = &cobra.Command{
 	Use:   "storyblok-cli",
-	Short: "AI-powered Storyblok CLI",
-	Long:  "Storyblok CLI with AI scaffolding and deployment features for React apps.",
+	Short: "AI-powered Code Generator with Storyblok",
+	Long:  "AI-powered Code Generator with Storyblok",
 }
 
 // Execute runs the root command (called from main.go)

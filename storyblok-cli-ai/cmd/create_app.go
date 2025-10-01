@@ -26,8 +26,8 @@ import (
 
 var createAppCmd = &cobra.Command{
 	Use:   "create",
-	Short: "Scaffold a React + Storyblok app (AI-powered)",
-	Long:  "Interactive wizard that scaffolds a React + Tailwind app integrated with Storyblok using the AI backend.",
+	Short: "Scaffold a Storyblok app (AI-powered)",
+	Long:  "Interactive wizard that scaffolds an app integrated with Storyblok using the AI backend.",
 	Run: func(cmd *cobra.Command, args []string) {
 		if err := runCreateWizard(cmd); err != nil {
 			printStructuredError(err)
@@ -456,8 +456,7 @@ func runCreateWizard(cmd *cobra.Command) error {
 
 		// Use spinner-wrapped backend call so user sees loading after answering follow-ups
 		qResp, err := callBackendWithSpinner(backendURL+"questions", qPayload, "Analyzing answers — generating follow-ups...")
-		respBytes, _ := json.MarshalIndent(qResp, "", "  ")
-		fmt.Println("DEBUG backend response:\n", string(respBytes))
+
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: question-generation failed (round %d): %v\n", round, err)
 			// fallback to generic prompt only on first round
@@ -611,7 +610,6 @@ func runCreateWizard(cmd *cobra.Command) error {
 				if deps, ok := md["dependencies"].(map[string]interface{}); ok {
 					if ndRaw, ok := deps["new_dependencies"]; ok {
 						if ndArr, ok := ndRaw.([]interface{}); ok && len(ndArr) > 0 {
-							fmt.Println("\nSuggested new dependencies:")
 							for _, d := range ndArr {
 								if s, ok := d.(string); ok {
 									fmt.Printf("  - %s\n", s)
@@ -792,7 +790,6 @@ func runCreateWizard(cmd *cobra.Command) error {
 		// read loop
 		for {
 			lineBytes, err := readJSONLine(reader)
-			fmt.Println("DEBUG raw line from stream:", string(lineBytes))
 			if err != nil {
 				if err == io.EOF {
 					break
@@ -806,7 +803,6 @@ func runCreateWizard(cmd *cobra.Command) error {
 				// ignore malformed line
 				continue
 			}
-			fmt.Println("DEBUG parsed event:", ev)
 			etype, _ := ev["event"].(string)
 			payloadEv := ev["payload"]
 
@@ -835,7 +831,6 @@ func runCreateWizard(cmd *cobra.Command) error {
 
 				path, _ := m["path"].(string)
 				chunk, _ := m["chunk"].(string)
-				fmt.Printf("DEBUG file chunk for %s: %s\n", path, chunk)
 				final, _ := m["final"].(bool)
 				tf, ok := tempFiles[path]
 				if !ok {
@@ -856,7 +851,6 @@ func runCreateWizard(cmd *cobra.Command) error {
 				// payloadEv may be []interface{} or other structured data from JSON
 				if arr, ok := payloadEv.([]interface{}); ok {
 					if len(arr) > 0 {
-						fmt.Println("\nSuggested new dependencies from model:")
 						for _, it := range arr {
 							if s, ok := it.(string); ok {
 								fmt.Printf("  - %s\n", s)
@@ -866,21 +860,7 @@ func runCreateWizard(cmd *cobra.Command) error {
 							}
 						}
 
-						// Optional: write a timestamped log file for debugging / audit
-						if logDirErr := os.MkdirAll("ai_backend_logs", 0o755); logDirErr == nil {
-							if b, err := json.MarshalIndent(arr, "", "  "); err == nil {
-								fname := fmt.Sprintf("ai_backend_logs/%d_new_dependencies.json", time.Now().Unix())
-								_ = os.WriteFile(fname, b, 0o644)
-							}
-						}
 					}
-				} else {
-					// fallback generic print + log
-					bs, _ := json.MarshalIndent(payloadEv, "", "  ")
-					fmt.Printf("\nnew_dependencies: %s\n", string(bs))
-					_ = os.MkdirAll("ai_backend_logs", 0o755)
-					fname := fmt.Sprintf("ai_backend_logs/%d_new_dependencies_misc.json", time.Now().Unix())
-					_ = os.WriteFile(fname, bs, 0o644)
 				}
 			case "unused_file":
 				if m, ok := payloadEv.(map[string]interface{}); ok {
@@ -1098,8 +1078,8 @@ func runStoryblokCreateAndCollect(framework, targetDir, token, packagemanager, r
 
 	cmd := exec.Command("npx", args...)
 	// run in the current working directory; CI environments may require env adjustments
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
 
 	if err := cmd.Run(); err != nil {
 		return "", nil, nil, fmt.Errorf("running storyblok create failed: %w", err)
