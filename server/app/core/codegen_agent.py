@@ -181,11 +181,13 @@ async def stream_generate_project(payload: Dict[str, Any]) -> AsyncGenerator[str
         else:
             full_prompt = system_prompt + "\n" + user_prompt + "\n\nReturn JSON with project_name, files[], metadata."
 
-        parsed = await call_structured_generation(full_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
+        parsed = await call_structured_generation(full_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug, temperature=AGENT_TEMPERATURES["codegen"])
         parsed = _ensure_parsed_dict("full_gen", parsed)
         # ensure metadata.followups is a list of dicts
-        if "metadata" in parsed and "followups" in parsed["metadata"]:
-            parsed["metadata"]["followups"] = _parse_followups(parsed["metadata"]["followups"])
+        if isinstance(parsed, dict):
+            md = parsed.get("metadata")
+            if isinstance(md, dict) and "followups" in md:
+                parsed["metadata"]["followups"] = _parse_followups(md["followups"])
         files = parsed.get("files", []) or []
         if base_files_map:
             files = _compute_delta_files(files, base_files_map)
@@ -228,7 +230,7 @@ async def stream_generate_project(payload: Dict[str, Any]) -> AsyncGenerator[str
     else:
         # scaffold
         scaffold_prompt = system_prompt + "\n" + user_prompt + "\n\nNow produce project-level scaffolding files (package.json, tsconfig, pages, services, env files). Return JSON with files[]."
-        parsed_scaffold = await call_structured_generation(scaffold_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
+        parsed_scaffold = await call_structured_generation(scaffold_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug, temperature=AGENT_TEMPERATURES["codegen"])
         parsed_scaffold = _ensure_parsed_dict("scaffold_gen", parsed_scaffold)
         scaffold_files = parsed_scaffold.get("files", []) or []
         async for ev in _stream_files_list(scaffold_files):
@@ -369,6 +371,10 @@ async def generate_project(payload: Dict[str, Any]) -> Dict[str, Any]:
     merged_warnings: List[str] = []
     llm_debug_all = []
 
+     # ensure these exist early to avoid NameError in branches
+    metadata: Dict[str, Any] = {}
+    validation_report: Dict[str, Any] = {"checked": False, "ok": None, "output": "", "skipped": False}
+
     # detect base_files passed in payload (overlay scenario)
     base_files_map = {}
     if isinstance(payload.get("base_files"), list):
@@ -386,11 +392,13 @@ async def generate_project(payload: Dict[str, Any]) -> Dict[str, Any]:
     else:
         full_prompt = system_prompt + "\n" + user_prompt + "\n\nReturn JSON with project_name, files[], metadata."
 
-    parsed = await call_structured_generation(full_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug)
+    parsed = await call_structured_generation(full_prompt, GenerateResponseModel, max_retries=LLM_RETRIES, timeout=TIMEOUT, debug=debug, temperature=AGENT_TEMPERATURES["codegen"])
     parsed = _ensure_parsed_dict("full_gen", parsed)
     # ensure metadata.followups is a list of dicts
-    if "metadata" in parsed and "followups" in parsed["metadata"]:
-        parsed["metadata"]["followups"] = _parse_followups(parsed["metadata"]["followups"])
+    if isinstance(parsed, dict):
+        md = parsed.get("metadata")
+        if isinstance(md, dict) and "followups" in md:
+            parsed["metadata"]["followups"] = _parse_followups(md["followups"])
     _log_raw_llm_output("generate_project_full", parsed, debug)
 
     files = parsed.get("files", []) or []
@@ -571,7 +579,7 @@ def _build_overlay_user_prompt(
         "- Follow the file format: e.g., if it's a Next.js project mainly using JavaScript, use JS format for new components, not TSX.\n"
         "- Use styling provided in project scaffold. example, tailwind\n"
         "- Modify readme is allowed\n"
-        "-Ensure page routing is possible\n"
+        "When modifying landing page like Home component, make sure it has some form of navigation to other pages.\n"
         "You are free not to use some components if not necessary to ensure project is as user expected\n"
         "- Do not add another Storyblok package.\n"
         "Output: produce a single JSON object with keys: project_name (optional), files (array of {path,content}), new_dependencies (array of package NAMES), warnings (optional).\n"
