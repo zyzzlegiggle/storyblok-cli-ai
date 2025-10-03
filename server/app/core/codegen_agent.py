@@ -22,13 +22,13 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, AsyncGenerator
 import requests
 
-from core.llm_client import call_structured_generation, GenerateResponseModel
-from core.prompts import build_system_prompt, build_user_prompt
-from core.dep_resolver import resolve_and_pin_files
-from core.validator import run_validations, attempt_repair
-from core.followup_agent import generate_followup_questions, _parse_followups  # localized import
-from utils.file_helpers import _safe_normalize
-from utils.config import AGENT_TEMPERATURES
+from .llm_client import call_structured_generation, GenerateResponseModel
+from .prompts import build_system_prompt, build_user_prompt
+from .dep_resolver import resolve_and_pin_files
+from .validator import run_validations, attempt_repair
+from .followup_agent import generate_followup_questions, _parse_followups  # localized import
+from ..utils.file_helpers import _safe_normalize
+from ..utils.config import AGENT_TEMPERATURES
 
 # configuration
 CHUNK_SIZE = int(os.environ.get("AI_CHUNK_SIZE", 10))
@@ -359,7 +359,7 @@ async def generate_project(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         request_questions = bool(options.get("request_questions", False))
         if request_questions:
-            from core.followup_agent import generate_followup_questions
+            from followup_agent import generate_followup_questions
             qres = await generate_followup_questions(payload)
             followups = qres.get("followups", []) if isinstance(qres, dict) else []
             if followups:
@@ -399,7 +399,7 @@ async def generate_project(payload: Dict[str, Any]) -> Dict[str, Any]:
         md = parsed.get("metadata")
         if isinstance(md, dict) and "followups" in md:
             parsed["metadata"]["followups"] = _parse_followups(md["followups"])
-    _log_raw_llm_output("generate_project_full", parsed, debug)
+    # _log_raw_llm_output("generate_project_full", parsed, debug)
 
     files = parsed.get("files", []) or []
     # compute delta if overlay context provided

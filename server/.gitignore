@@ -70,3 +70,5 @@ versions/ # if you don't want to track migration files in Git
 alembic.ini # if you want to keep it local
 
 ai_backend_logs
+
+docker-compose.yml

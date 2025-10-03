@@ -3,9 +3,9 @@ import time
 import json
 from typing import Any, Dict, List, Optional
 
-from core.prompts import build_question_generation_prompt, build_followup_system_prompt
-from core.llm_client import call_structured_generation, FollowupsListModel
-from utils.config import AGENT_TEMPERATURES
+from .prompts import build_question_generation_prompt, build_followup_system_prompt
+from .llm_client import call_structured_generation, FollowupsListModel
+from ..utils.config import AGENT_TEMPERATURES
 
 # in followup_agent.py - replace _parse_followups and generate_followup_questions
 

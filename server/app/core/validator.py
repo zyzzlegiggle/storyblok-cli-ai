@@ -8,8 +8,8 @@ import time
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 
-from core.llm_client import call_structured_generation, GenerateResponseModel
-from utils.config import AGENT_TEMPERATURES
+from .llm_client import call_structured_generation, GenerateResponseModel
+from ..utils.config import AGENT_TEMPERATURES
 
 # Configuration (can be tuned via env)
 LLM_RETRIES = int(os.environ.get("AI_RETRY_COUNT", 2))
