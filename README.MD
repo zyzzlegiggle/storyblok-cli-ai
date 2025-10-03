@@ -75,11 +75,18 @@ go build -o storyblok-cli ./
 ./storyblok-cli create
 ```
 
-Or run directly:
+run directly:
 
 ```bash
 go run ./main.go create
 ```
+
+#### Download Release (Windows)
+
+Download the prebuilt binary from the [Releases page](https://github.com/zyzzlegiggle/storyblok-cli-ai/releases/tag/releaseV2) and run:
+
+```bash
+./storyblok-cli-ai.exe create
 
 ---
 
